@@ -9,10 +9,9 @@ terraform {
   }
   
   backend "s3" {
-    # Configure your backend
-    # bucket = "your-terraform-state-bucket"
-    # key    = "aws-utils/auto-shutdown/terraform.tfstate"
-    # region = "ap-southeast-2"
+    bucket = "aws-utils-terraform-state-bucket"
+    key    = "aws-utils/auto-shutdown/terraform.tfstate"
+    region = "ap-southeast-2"
   }
 }
 
