@@ -1,0 +1,35 @@
+# AWS Auto-Shutdown Configuration
+# Copy this file to terraform.tfvars and update with your values
+
+# AWS region for Lambda deployment
+aws_region = "ap-southeast-2"
+
+# Email for shutdown notifications (required)
+notification_email = "your-email@example.com"
+
+# Maximum age in days before shutdown (default: 3)
+max_age_days = 3
+
+# Run in dry-run mode (default: false)
+# Set to "true" for testing without actually stopping resources
+dry_run = "false"
+
+# AWS regions to scan for old resources
+target_regions = [
+  "us-east-1",
+  "us-west-2", 
+  "ap-southeast-2",
+  "ap-southeast-4",
+  "eu-west-1"
+]
+
+# Schedule expression (default: 10 PM UTC daily)
+# Examples:
+# - "cron(0 22 * * ? *)"    # 10 PM UTC daily
+# - "cron(0 10 * * ? *)"    # 10 AM UTC daily
+# - "rate(12 hours)"        # Every 12 hours
+schedule_expression = "cron(0 22 * * ? *)"
+
+# Slack notifications (optional)
+enable_slack_notifications = false
+# slack_webhook_url = "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
