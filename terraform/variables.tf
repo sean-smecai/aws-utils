@@ -1,7 +1,7 @@
 variable "aws_region" {
   description = "AWS region for deployment"
   type        = string
-  default     = "ap-southeast-2"
+  default     = "ap-southeast-4"
 }
 
 variable "max_age_days" {
@@ -46,8 +46,17 @@ variable "enable_slack_notifications" {
 }
 
 variable "slack_webhook_url" {
-  description = "Slack webhook URL for notifications"
+  description = "Slack webhook URL for notifications (optional)"
   type        = string
   default     = ""
-  sensitive   = true
+}
+
+variable "log_level" {
+  description = "Logging level: minimal (summary only) or verbose (detailed)"
+  type        = string
+  default     = "minimal"
+  validation {
+    condition     = contains(["minimal", "verbose"], var.log_level)
+    error_message = "Log level must be either 'minimal' or 'verbose'."
+  }
 }

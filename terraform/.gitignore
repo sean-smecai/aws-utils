@@ -23,4 +23,9 @@ Thumbs.db
 *.tmp
 *.bak
 
+# Lambda deployment artifacts
 *.zip
+
+# Test files
+response.json
+payload.json

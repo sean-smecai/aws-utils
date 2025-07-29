@@ -15,6 +15,16 @@ MAX_AGE_DAYS = int(os.environ.get('MAX_AGE_DAYS', '3'))
 DRY_RUN = os.environ.get('DRY_RUN', 'false').lower() == 'true'
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', '')
 REGIONS = os.environ.get('REGIONS', 'us-east-1,us-west-2,ap-southeast-2').split(',')
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'minimal')  # minimal|verbose
+
+def log_verbose(message):
+    """Print message only in verbose mode"""
+    if LOG_LEVEL == 'verbose':
+        print(message)
+
+def log_minimal(message):
+    """Print message in both minimal and verbose modes"""
+    print(message)
 
 def get_age_days(launch_time):
     """Calculate age in days from launch time"""
@@ -26,7 +36,7 @@ def get_age_days(launch_time):
 
 def shutdown_old_ec2_instances(ec2_client, region, summary):
     """Stop EC2 instances older than MAX_AGE_DAYS"""
-    print(f"Checking EC2 instances in {region}...")
+    log_verbose(f"Checking EC2 instances in {region}...")
     
     response = ec2_client.describe_instances(
         Filters=[{'Name': 'instance-state-name', 'Values': ['running']}]
@@ -43,7 +53,7 @@ def shutdown_old_ec2_instances(ec2_client, region, summary):
                         if tag['Key'] == 'Name'), 'Unnamed')
             
             if age_days >= MAX_AGE_DAYS:
-                print(f"  Instance {instance_id} ({name}) is {age_days} days old")
+                log_minimal(f"EC2 {instance_id} ({name}) in {region} - {age_days} days old")
                 summary['ec2_instances'].append({
                     'id': instance_id,
                     'name': name,
@@ -64,14 +74,14 @@ def shutdown_old_ec2_instances(ec2_client, region, summary):
                                 {'Key': 'AutoShutdownReason', 'Value': f'Running-for-{age_days}-days'}
                             ]
                         )
-                        print(f"  Stopped instance {instance_id}")
+                        log_minimal(f"Stopped EC2 {instance_id}")
                     except Exception as e:
-                        print(f"  Error stopping instance {instance_id}: {e}")
+                        log_minimal(f"Error stopping EC2 {instance_id}: {e}")
                         summary['errors'].append(f"EC2 {instance_id}: {str(e)}")
 
 def shutdown_old_rds_instances(rds_client, region, summary):
     """Stop RDS instances older than MAX_AGE_DAYS"""
-    print(f"Checking RDS instances in {region}...")
+    log_verbose(f"Checking RDS instances in {region}...")
     
     try:
         response = rds_client.describe_db_instances()
@@ -83,7 +93,7 @@ def shutdown_old_rds_instances(rds_client, region, summary):
                 age_days = get_age_days(create_time)
                 
                 if age_days >= MAX_AGE_DAYS:
-                    print(f"  RDS instance {db_id} is {age_days} days old")
+                    log_minimal(f"RDS {db_id} in {region} - {age_days} days old")
                     summary['rds_instances'].append({
                         'id': db_id,
                         'region': region,
@@ -103,16 +113,16 @@ def shutdown_old_rds_instances(rds_client, region, summary):
                                     {'Key': 'AutoShutdownReason', 'Value': f'Running-for-{age_days}-days'}
                                 ]
                             )
-                            print(f"  Stopped RDS instance {db_id}")
+                            log_minimal(f"Stopped RDS {db_id}")
                         except Exception as e:
-                            print(f"  Error stopping RDS instance {db_id}: {e}")
+                            log_minimal(f"Error stopping RDS {db_id}: {e}")
                             summary['errors'].append(f"RDS {db_id}: {str(e)}")
     except Exception as e:
-        print(f"  Error listing RDS instances in {region}: {e}")
+        log_verbose(f"Error listing RDS instances in {region}: {e}")
 
 def shutdown_old_ecs_services(ecs_client, region, summary):
     """Scale down ECS services older than MAX_AGE_DAYS"""
-    print(f"Checking ECS services in {region}...")
+    log_verbose(f"Checking ECS services in {region}...")
     
     try:
         clusters = ecs_client.list_clusters()['clusterArns']
@@ -133,7 +143,7 @@ def shutdown_old_ecs_services(ecs_client, region, summary):
                         age_days = get_age_days(created_at)
                         
                         if age_days >= MAX_AGE_DAYS:
-                            print(f"  ECS service {service_name} is {age_days} days old")
+                            log_minimal(f"ECS {service_name} in {region} - {age_days} days old")
                             summary['ecs_services'].append({
                                 'name': service_name,
                                 'cluster': cluster.split('/')[-1],
@@ -149,16 +159,16 @@ def shutdown_old_ecs_services(ecs_client, region, summary):
                                         service=service['serviceArn'],
                                         desiredCount=0
                                     )
-                                    print(f"  Scaled down ECS service {service_name}")
+                                    log_minimal(f"Scaled down ECS {service_name}")
                                 except Exception as e:
-                                    print(f"  Error scaling down ECS service {service_name}: {e}")
+                                    log_minimal(f"Error scaling down ECS {service_name}: {e}")
                                     summary['errors'].append(f"ECS {service_name}: {str(e)}")
     except Exception as e:
-        print(f"  Error listing ECS services in {region}: {e}")
+        log_verbose(f"Error listing ECS services in {region}: {e}")
 
 def cleanup_nat_gateways(ec2_client, region, summary):
     """Delete NAT Gateways older than MAX_AGE_DAYS"""
-    print(f"Checking NAT Gateways in {region}...")
+    log_verbose(f"Checking NAT Gateways in {region}...")
     
     try:
         response = ec2_client.describe_nat_gateways(
@@ -171,7 +181,7 @@ def cleanup_nat_gateways(ec2_client, region, summary):
             age_days = get_age_days(create_time)
             
             if age_days >= MAX_AGE_DAYS:
-                print(f"  NAT Gateway {nat_id} is {age_days} days old")
+                log_minimal(f"NAT Gateway {nat_id} in {region} - {age_days} days old")
                 summary['nat_gateways'].append({
                     'id': nat_id,
                     'region': region,
@@ -181,17 +191,25 @@ def cleanup_nat_gateways(ec2_client, region, summary):
                 if not DRY_RUN:
                     try:
                         ec2_client.delete_nat_gateway(NatGatewayId=nat_id)
-                        print(f"  Deleted NAT Gateway {nat_id}")
+                        log_minimal(f"Deleted NAT Gateway {nat_id}")
                     except Exception as e:
-                        print(f"  Error deleting NAT Gateway {nat_id}: {e}")
+                        log_minimal(f"Error deleting NAT Gateway {nat_id}: {e}")
                         summary['errors'].append(f"NAT {nat_id}: {str(e)}")
     except Exception as e:
-        print(f"  Error listing NAT Gateways in {region}: {e}")
+        log_verbose(f"Error listing NAT Gateways in {region}: {e}")
 
 def lambda_handler(event, context):
     """Main Lambda handler"""
-    print(f"AWS Auto-Shutdown Lambda - Max age: {MAX_AGE_DAYS} days, Dry run: {DRY_RUN}")
-    print(f"Regions to check: {REGIONS}")
+    # Allow overriding config via event payload
+    global MAX_AGE_DAYS, DRY_RUN
+    
+    if 'max_age_days' in event:
+        MAX_AGE_DAYS = int(event['max_age_days'])
+    
+    if 'dry_run' in event:
+        DRY_RUN = bool(event['dry_run'])
+    
+    log_minimal(f"AWS Auto-Shutdown - Age: {MAX_AGE_DAYS}d, DryRun: {DRY_RUN}, Regions: {len(REGIONS)}")
     
     # Summary for reporting
     summary = {
@@ -207,8 +225,7 @@ def lambda_handler(event, context):
     
     # Process each region
     for region in REGIONS:
-        print(f"\nProcessing region: {region}")
-        print("-" * 40)
+        log_verbose(f"Processing region: {region}")
         
         try:
             # EC2
@@ -227,7 +244,7 @@ def lambda_handler(event, context):
             cleanup_nat_gateways(ec2_client, region, summary)
             
         except Exception as e:
-            print(f"Error processing region {region}: {e}")
+            log_minimal(f"Error processing region {region}: {e}")
             summary['errors'].append(f"Region {region}: {str(e)}")
     
     # Calculate totals
@@ -238,13 +255,8 @@ def lambda_handler(event, context):
         len(summary['nat_gateways'])
     )
     
-    print(f"\n{'=' * 50}")
-    print(f"Summary: {total_resources} resources found")
-    print(f"- EC2 Instances: {len(summary['ec2_instances'])}")
-    print(f"- RDS Instances: {len(summary['rds_instances'])}")
-    print(f"- ECS Services: {len(summary['ecs_services'])}")
-    print(f"- NAT Gateways: {len(summary['nat_gateways'])}")
-    print(f"- Errors: {len(summary['errors'])}")
+    # Final summary (always logged)
+    log_minimal(f"Summary: {total_resources} resources found - EC2:{len(summary['ec2_instances'])}, RDS:{len(summary['rds_instances'])}, ECS:{len(summary['ecs_services'])}, NAT:{len(summary['nat_gateways'])}, Errors:{len(summary['errors'])}")
     
     # Send SNS notification if resources were shut down
     if total_resources > 0 and SNS_TOPIC_ARN:
@@ -308,9 +320,9 @@ To restart resources:
             Subject=subject,
             Message=message
         )
-        print(f"Notification sent to {SNS_TOPIC_ARN}")
+        log_minimal(f"Notification sent")
     except Exception as e:
-        print(f"Error sending notification: {e}")
+        log_minimal(f"Error sending notification: {e}")
 
 if __name__ == "__main__":
     # For local testing

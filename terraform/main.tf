@@ -146,6 +146,7 @@ resource "aws_lambda_function" "auto_shutdown" {
       DRY_RUN           = var.dry_run
       SNS_TOPIC_ARN     = aws_sns_topic.notifications.arn
       REGIONS           = join(",", var.target_regions)
+      LOG_LEVEL         = var.log_level
     }
   }
 
@@ -158,7 +159,7 @@ resource "aws_lambda_function" "auto_shutdown" {
 # CloudWatch Logs
 resource "aws_cloudwatch_log_group" "lambda_logs" {
   name              = "/aws/lambda/aws-auto-shutdown"
-  retention_in_days = 14
+  retention_in_days = 1  # Minimal retention for free tier
 }
 
 # EventBridge rule for daily execution

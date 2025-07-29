@@ -69,6 +69,24 @@ The Lambda function will stop/delete:
 - `dry_run`: Test mode without stopping resources (default: "false")
 - `target_regions`: List of regions to scan (default: us-east-1, us-west-2, ap-southeast-2, ap-southeast-4, eu-west-1)
 - `schedule_expression`: CloudWatch Events schedule (default: "cron(0 22 * * ? *)")
+- `log_level`: Logging verbosity - "minimal" or "verbose" (default: "minimal")
+
+### Free Tier Optimization
+
+The configuration is optimized to stay within AWS free tier limits:
+
+- **CloudWatch Logs**: 1-day retention to minimize log ingestion costs
+- **Log Level**: Set to "minimal" by default - only logs resource actions and final summary
+- **Lambda**: Efficient execution time and memory usage
+
+**Cost comparison:**
+- `log_level = "minimal"`: ~$0-0.50/month (stays in free tier)
+- `log_level = "verbose"`: ~$1-3/month (may exceed free tier for CloudWatch logs)
+
+To enable detailed logging for debugging:
+```hcl
+log_level = "verbose"
+```
 
 ### Schedule Examples
 
