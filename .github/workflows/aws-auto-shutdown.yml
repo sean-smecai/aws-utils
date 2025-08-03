@@ -72,7 +72,7 @@ jobs:
           fi
       
       - name: Upload shutdown report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: aws-shutdown-report
           path: aws-resources-report.json
