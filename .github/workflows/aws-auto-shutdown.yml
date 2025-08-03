@@ -47,33 +47,35 @@ jobs:
       - name: Install dependencies
         run: |
           pip install boto3
+          sudo apt-get update
+          sudo apt-get install -y jq
       
       - name: Generate resource report
         id: report
         run: |
           python scripts/aws-shutdown-report.py \
             --max-age-days ${{ github.event.inputs.max_age_days || '3' }} \
-            --output shutdown-report.json
+            --output aws-resources-report.json
           
           # Extract summary for PR comment
-          echo "RESOURCES_TO_SHUTDOWN=$(jq -r '.summary.resources_to_shutdown' shutdown-report.json)" >> $GITHUB_OUTPUT
-          echo "DAILY_SAVINGS=$(jq -r '.summary.estimated_daily_savings' shutdown-report.json)" >> $GITHUB_OUTPUT
+          echo "RESOURCES_TO_SHUTDOWN=$(jq -r '.summary.resources_to_shutdown' aws-resources-report.json)" >> $GITHUB_OUTPUT
+          echo "DAILY_SAVINGS=$(jq -r '.summary.estimated_daily_savings' aws-resources-report.json)" >> $GITHUB_OUTPUT
       
       - name: Run auto-shutdown script
         env:
           DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
         run: |
           if [ "$DRY_RUN" = "true" ]; then
-            ./scripts/aws-auto-shutdown.sh --dry-run
+            ./scripts/aws-auto-shutdown.sh --dry-run --max-age-days ${{ github.event.inputs.max_age_days || '3' }}
           else
-            ./scripts/aws-auto-shutdown.sh
+            ./scripts/aws-auto-shutdown.sh --execute --max-age-days ${{ github.event.inputs.max_age_days || '3' }}
           fi
       
       - name: Upload shutdown report
         uses: actions/upload-artifact@v3
         with:
           name: aws-shutdown-report
-          path: shutdown-report.json
+          path: aws-resources-report.json
       
       - name: Create issue for shutdown summary
         if: steps.report.outputs.RESOURCES_TO_SHUTDOWN > 0
@@ -81,7 +83,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            const report = JSON.parse(fs.readFileSync('shutdown-report.json', 'utf8'));
+            const report = JSON.parse(fs.readFileSync('aws-resources-report.json', 'utf8'));
             
             let issueBody = `## AWS Resource Auto-Shutdown Report\n\n`;
             issueBody += `**Date**: ${new Date().toISOString()}\n`;
