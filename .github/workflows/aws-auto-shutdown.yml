@@ -1,0 +1,143 @@
+name: AWS Auto-Shutdown Old Resources
+
+on:
+  schedule:
+    # Run daily at 10 PM UTC (8 AM AEST)
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run in dry-run mode (no resources will be stopped)'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      max_age_days:
+        description: 'Maximum age in days before shutdown'
+        required: false
+        default: '3'
+        type: string
+
+jobs:
+  shutdown-resources:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      issues: write  # To create issues for shutdown reports
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-southeast-2
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install boto3
+      
+      - name: Generate resource report
+        id: report
+        run: |
+          python scripts/aws-shutdown-report.py \
+            --max-age-days ${{ github.event.inputs.max_age_days || '3' }} \
+            --output shutdown-report.json
+          
+          # Extract summary for PR comment
+          echo "RESOURCES_TO_SHUTDOWN=$(jq -r '.summary.resources_to_shutdown' shutdown-report.json)" >> $GITHUB_OUTPUT
+          echo "DAILY_SAVINGS=$(jq -r '.summary.estimated_daily_savings' shutdown-report.json)" >> $GITHUB_OUTPUT
+      
+      - name: Run auto-shutdown script
+        env:
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            ./scripts/aws-auto-shutdown.sh --dry-run
+          else
+            ./scripts/aws-auto-shutdown.sh
+          fi
+      
+      - name: Upload shutdown report
+        uses: actions/upload-artifact@v3
+        with:
+          name: aws-shutdown-report
+          path: shutdown-report.json
+      
+      - name: Create issue for shutdown summary
+        if: steps.report.outputs.RESOURCES_TO_SHUTDOWN > 0
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('shutdown-report.json', 'utf8'));
+            
+            let issueBody = `## AWS Resource Auto-Shutdown Report\n\n`;
+            issueBody += `**Date**: ${new Date().toISOString()}\n`;
+            issueBody += `**Mode**: ${{ github.event.inputs.dry_run == 'false' && 'EXECUTED' || 'DRY RUN' }}\n\n`;
+            issueBody += `### Summary\n`;
+            issueBody += `- Resources older than ${{ github.event.inputs.max_age_days || '3' }} days: **${report.summary.resources_to_shutdown}**\n`;
+            issueBody += `- Estimated daily savings: **$${report.summary.estimated_daily_savings.toFixed(2)}**\n\n`;
+            
+            if (report.resources_to_shutdown.length > 0) {
+              issueBody += `### Resources Affected\n\n`;
+              issueBody += `| Type | Resource ID | Name | Region | Age (days) | Est. Daily Cost |\n`;
+              issueBody += `|------|-------------|------|--------|------------|----------------|\n`;
+              
+              report.resources_to_shutdown.forEach(resource => {
+                issueBody += `| ${resource.Type} | ${resource.Id} | ${resource.Name} | ${resource.Region} | ${resource.AgeDays} | $${(resource.EstimatedDailyCost || 0).toFixed(2)} |\n`;
+              });
+              
+              issueBody += `\n### How to Restart Resources\n\n`;
+              issueBody += `\`\`\`bash\n`;
+              issueBody += `# EC2 Instances\n`;
+              issueBody += `aws ec2 start-instances --instance-ids <instance-id>\n\n`;
+              issueBody += `# RDS Instances\n`;
+              issueBody += `aws rds start-db-instance --db-instance-identifier <db-id>\n\n`;
+              issueBody += `# ECS Services\n`;
+              issueBody += `aws ecs update-service --cluster <cluster> --service <service> --desired-count <count>\n`;
+              issueBody += `\`\`\`\n`;
+            }
+            
+            const title = `AWS Auto-Shutdown: ${report.summary.resources_to_shutdown} resources affected`;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: issueBody,
+              labels: ['aws', 'cost-optimization', 'automated']
+            });
+      
+      - name: Send Slack notification
+        if: steps.report.outputs.RESOURCES_TO_SHUTDOWN > 0 && github.event.inputs.dry_run == 'false'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ ! -z "$SLACK_WEBHOOK_URL" ]; then
+            curl -X POST $SLACK_WEBHOOK_URL \
+              -H 'Content-Type: application/json' \
+              -d '{
+                "text": "AWS Auto-Shutdown Complete",
+                "blocks": [
+                  {
+                    "type": "section",
+                    "text": {
+                      "type": "mrkdwn",
+                      "text": "*AWS Auto-Shutdown Complete*\n• Resources shut down: '"${{ steps.report.outputs.RESOURCES_TO_SHUTDOWN }}"'\n• Daily savings: $'"${{ steps.report.outputs.DAILY_SAVINGS }}"'\n• <'"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"'|View Details>"
+                    }
+                  }
+                ]
+              }'
+          fi
