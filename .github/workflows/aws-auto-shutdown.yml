@@ -28,7 +28,7 @@ jobs:
       contents: read
       issues: write  # To create issues for shutdown reports
     
-    steps:
+    steps: bamboo
       - name: Checkout code
         uses: actions/checkout@v4
       
