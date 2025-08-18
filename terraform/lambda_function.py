@@ -22,6 +22,13 @@ SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', '')
 REGIONS = os.environ.get('REGIONS', 'us-east-1,us-west-2,ap-southeast-2').split(',')
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'minimal')  # minimal|verbose
 
+# Cost optimization configuration
+COST_ANALYSIS_ENABLED = os.environ.get('COST_ANALYSIS_ENABLED', 'true').lower() == 'true'
+HIGH_VALUE_THRESHOLD = float(os.environ.get('HIGH_VALUE_THRESHOLD', '100'))  # USD per month
+COST_PRIORITY_THRESHOLD = float(os.environ.get('COST_PRIORITY_THRESHOLD', '50'))  # USD per month
+SCHEDULING_MODE = os.environ.get('SCHEDULING_MODE', 'cost_optimized')  # cost_optimized|aggressive|conservative
+BUSINESS_HOURS_ONLY = os.environ.get('BUSINESS_HOURS_ONLY', 'false').lower() == 'true'
+
 # Exclusion patterns for resource protection
 S3_BUCKET_EXCLUSIONS = os.environ.get('S3_BUCKET_EXCLUSIONS', 'terraform-state,cloudtrail,logs,backup').split(',')
 ELB_NAME_EXCLUSIONS = os.environ.get('ELB_NAME_EXCLUSIONS', 'production,critical').split(',')
@@ -684,6 +691,225 @@ def cleanup_nat_gateways(ec2_client, region, summary):
         log_error(f"Failed to scan NAT Gateways in {region}", e, region=region)
         summary['errors'].append(f"NAT scan {region}: {str(e)}")
 
+def get_resource_cost_estimate(resource_type: str, resource_info: Dict[str, Any], region: str) -> float:
+    """Estimate monthly cost for a resource"""
+    try:
+        # Simplified cost estimates - in production would use AWS Cost Explorer API
+        cost_map = {
+            'ec2': {
+                't2.micro': 8.50,
+                't2.small': 17.00,
+                't2.medium': 34.00,
+                't2.large': 68.00,
+                't3.micro': 7.60,
+                't3.small': 15.20,
+                't3.medium': 30.40,
+                't3.large': 60.80,
+                'm5.large': 70.00,
+                'm5.xlarge': 140.00,
+                'c5.large': 62.00,
+                'c5.xlarge': 124.00
+            },
+            'rds': {
+                'db.t2.micro': 13.00,
+                'db.t2.small': 26.00,
+                'db.t3.micro': 12.00,
+                'db.t3.small': 24.00,
+                'db.m5.large': 115.00,
+                'db.m5.xlarge': 230.00
+            },
+            'nat_gateway': 45.00,  # Fixed cost per NAT gateway
+            'elb': 25.00,  # Approximate ELB cost
+            's3': 0.023,  # Per GB stored
+            'elasticsearch': {
+                't2.small.elasticsearch': 37.00,
+                't2.medium.elasticsearch': 74.00,
+                'm5.large.elasticsearch': 142.00
+            }
+        }
+        
+        if resource_type == 'ec2':
+            instance_type = resource_info.get('instance_type', 't2.micro')
+            return cost_map['ec2'].get(instance_type, 50.00)  # Default estimate
+            
+        elif resource_type == 'rds':
+            instance_class = resource_info.get('instance_class', 'db.t2.micro')
+            return cost_map['rds'].get(instance_class, 30.00)
+            
+        elif resource_type == 'nat_gateway':
+            return cost_map['nat_gateway']
+            
+        elif resource_type == 'elb':
+            return cost_map['elb']
+            
+        elif resource_type == 's3':
+            # Estimate based on bucket size (simplified)
+            return resource_info.get('size_gb', 10) * cost_map['s3']
+            
+        elif resource_type == 'elasticsearch':
+            instance_type = resource_info.get('instance_type', 't2.small.elasticsearch')
+            return cost_map['elasticsearch'].get(instance_type, 50.00)
+            
+        return 10.00  # Default estimate for unknown resources
+        
+    except Exception as e:
+        structured_log('WARNING', f"Failed to estimate cost for {resource_type}", error=str(e))
+        return 10.00
+
+def analyze_cost_impact(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Analyze cost impact of cleanup operations"""
+    cost_analysis = {
+        'total_monthly_savings': 0.0,
+        'high_value_resources': [],
+        'cost_by_type': {},
+        'cost_by_region': defaultdict(float),
+        'recommendations': []
+    }
+    
+    try:
+        # Analyze EC2 instances
+        for instance in summary.get('ec2_instances', []):
+            cost = get_resource_cost_estimate('ec2', {
+                'instance_type': instance.get('type')
+            }, instance.get('region'))
+            
+            cost_analysis['total_monthly_savings'] += cost
+            cost_analysis['cost_by_type']['ec2'] = cost_analysis['cost_by_type'].get('ec2', 0) + cost
+            cost_analysis['cost_by_region'][instance.get('region')] += cost
+            
+            if cost >= HIGH_VALUE_THRESHOLD:
+                cost_analysis['high_value_resources'].append({
+                    'type': 'ec2',
+                    'id': instance['id'],
+                    'name': instance.get('name'),
+                    'monthly_cost': cost
+                })
+        
+        # Analyze RDS instances
+        for db in summary.get('rds_instances', []):
+            cost = get_resource_cost_estimate('rds', {
+                'instance_class': db.get('class')
+            }, db.get('region'))
+            
+            cost_analysis['total_monthly_savings'] += cost
+            cost_analysis['cost_by_type']['rds'] = cost_analysis['cost_by_type'].get('rds', 0) + cost
+            cost_analysis['cost_by_region'][db.get('region')] += cost
+            
+            if cost >= HIGH_VALUE_THRESHOLD:
+                cost_analysis['high_value_resources'].append({
+                    'type': 'rds',
+                    'id': db['id'],
+                    'monthly_cost': cost
+                })
+        
+        # Analyze NAT gateways
+        for nat in summary.get('nat_gateways', []):
+            cost = get_resource_cost_estimate('nat_gateway', {}, nat.get('region'))
+            cost_analysis['total_monthly_savings'] += cost
+            cost_analysis['cost_by_type']['nat_gateway'] = cost_analysis['cost_by_type'].get('nat_gateway', 0) + cost
+            cost_analysis['cost_by_region'][nat.get('region')] += cost
+        
+        # Generate recommendations
+        if cost_analysis['total_monthly_savings'] > 500:
+            cost_analysis['recommendations'].append(
+                f"High cost impact detected: ${cost_analysis['total_monthly_savings']:.2f}/month potential savings"
+            )
+        
+        if cost_analysis['high_value_resources']:
+            cost_analysis['recommendations'].append(
+                f"Found {len(cost_analysis['high_value_resources'])} high-value resources requiring approval"
+            )
+        
+        # Publish cost metrics
+        if COST_ANALYSIS_ENABLED:
+            publish_cloudwatch_metric('EstimatedMonthlySavings', 
+                                     cost_analysis['total_monthly_savings'],
+                                     unit='None')
+            publish_cloudwatch_metric('HighValueResourcesFound', 
+                                     len(cost_analysis['high_value_resources']),
+                                     unit='Count')
+        
+    except Exception as e:
+        log_error("Failed to analyze cost impact", e)
+    
+    return cost_analysis
+
+def should_cleanup_based_on_schedule() -> bool:
+    """Determine if cleanup should run based on scheduling configuration"""
+    now = datetime.now(timezone.utc)
+    
+    # Business hours check (9 AM - 5 PM UTC)
+    if BUSINESS_HOURS_ONLY:
+        hour = now.hour
+        if hour < 9 or hour >= 17:
+            structured_log('INFO', "Skipping cleanup - outside business hours",
+                         current_hour=hour,
+                         business_hours="9-17 UTC")
+            return False
+    
+    # Cost-optimized scheduling (run at optimal times for cost savings)
+    if SCHEDULING_MODE == 'cost_optimized':
+        # Run at end of day to maximize daily cost savings
+        if now.hour not in [20, 21, 22, 23]:  # 8 PM - 11 PM UTC
+            structured_log('DEBUG', "Not optimal time for cost-optimized cleanup",
+                         current_hour=now.hour,
+                         optimal_hours="20-23 UTC")
+            # Still allow execution but log it
+    
+    elif SCHEDULING_MODE == 'conservative':
+        # Only run once per day at specific time
+        if now.hour != 22:  # 10 PM UTC only
+            structured_log('INFO', "Conservative mode - skipping non-scheduled hour",
+                         current_hour=now.hour,
+                         scheduled_hour=22)
+            return False
+    
+    # aggressive mode runs always
+    return True
+
+def prioritize_resources_by_cost(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """Prioritize resources for cleanup based on cost impact"""
+    if not COST_ANALYSIS_ENABLED:
+        return summary
+    
+    try:
+        # Calculate cost for each resource and sort by cost
+        for resource_type in ['ec2_instances', 'rds_instances', 'nat_gateways']:
+            if resource_type in summary:
+                resources = summary[resource_type]
+                for resource in resources:
+                    if resource_type == 'ec2_instances':
+                        resource['estimated_cost'] = get_resource_cost_estimate(
+                            'ec2', 
+                            {'instance_type': resource.get('type')},
+                            resource.get('region')
+                        )
+                    elif resource_type == 'rds_instances':
+                        resource['estimated_cost'] = get_resource_cost_estimate(
+                            'rds',
+                            {'instance_class': resource.get('class')},
+                            resource.get('region')
+                        )
+                    elif resource_type == 'nat_gateways':
+                        resource['estimated_cost'] = get_resource_cost_estimate(
+                            'nat_gateway', {}, resource.get('region')
+                        )
+                
+                # Sort by cost (highest first)
+                summary[resource_type] = sorted(
+                    resources,
+                    key=lambda x: x.get('estimated_cost', 0),
+                    reverse=True
+                )
+        
+        structured_log('INFO', "Resources prioritized by cost impact",
+                      scheduling_mode=SCHEDULING_MODE)
+        
+    except Exception as e:
+        log_error("Failed to prioritize resources by cost", e)
+    
+    return summary
+
 def load_protection_config() -> Dict[str, Any]:
     """Load protection configuration from various sources"""
     global PROTECTION_CONFIG
@@ -1274,6 +1500,20 @@ def lambda_handler(event, context):
     # Load protection configuration
     load_protection_config()
     
+    # Check scheduling constraints
+    if not should_cleanup_based_on_schedule():
+        structured_log('INFO', "Cleanup skipped due to scheduling constraints",
+                      scheduling_mode=SCHEDULING_MODE,
+                      business_hours_only=BUSINESS_HOURS_ONLY)
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': "Cleanup skipped - outside scheduled window",
+                'correlation_id': CORRELATION_ID,
+                'scheduling_mode': SCHEDULING_MODE
+            })
+        }
+    
     if 'max_age_days' in event:
         MAX_AGE_DAYS = int(event['max_age_days'])
     
@@ -1362,6 +1602,10 @@ def lambda_handler(event, context):
         log_error("Failed to process S3 buckets", e)
         summary['errors'].append(f"S3 buckets: {str(e)}")
     
+    # Prioritize resources by cost if enabled
+    if COST_ANALYSIS_ENABLED:
+        summary = prioritize_resources_by_cost(summary)
+    
     # Calculate totals
     total_resources = (
         len(summary['ec2_instances']) +
@@ -1372,6 +1616,12 @@ def lambda_handler(event, context):
         len(summary.get('s3_buckets', [])) +
         len(summary.get('elasticsearch_domains', []))
     )
+    
+    # Perform cost impact analysis
+    cost_analysis = {}
+    if COST_ANALYSIS_ENABLED:
+        cost_analysis = analyze_cost_impact(summary)
+        summary['cost_analysis'] = cost_analysis
     
     # Calculate execution metrics
     execution_duration = time.time() - execution_start
@@ -1436,12 +1686,18 @@ def send_notification(summary, total_resources):
     
     subject = f"AWS Auto-Shutdown: {total_resources} resources {'identified' if DRY_RUN else 'stopped'}"
     
+    # Get cost analysis data
+    cost_analysis = summary.get('cost_analysis', {})
+    monthly_savings = cost_analysis.get('total_monthly_savings', 0)
+    high_value_resources = cost_analysis.get('high_value_resources', [])
+    
     message = f"""AWS Auto-Shutdown Report
 {'=' * 50}
 Mode: {'DRY RUN' if DRY_RUN else 'EXECUTED'}
 Time: {summary['timestamp']}
 Correlation ID: {summary.get('correlation_id', 'N/A')}
 Max Age: {MAX_AGE_DAYS} days
+Scheduling Mode: {SCHEDULING_MODE}
 
 Resources Summary:
 - EC2 Instances: {len(summary['ec2_instances'])}
@@ -1451,6 +1707,11 @@ Resources Summary:
 - Load Balancers: {len(summary.get('load_balancers', []))}
 - S3 Buckets: {len(summary.get('s3_buckets', []))}
 - Elasticsearch Domains: {len(summary.get('elasticsearch_domains', []))}
+
+Cost Analysis:
+- Estimated Monthly Savings: ${monthly_savings:.2f}
+- High-Value Resources: {len(high_value_resources)}
+- Cost-Optimized Scheduling: {SCHEDULING_MODE}
 
 Performance Metrics:
 - Execution Duration: {summary.get('performance_metrics', {}).get('execution_duration_ms', 'N/A')} ms

@@ -180,6 +180,13 @@ resource "aws_lambda_function" "auto_shutdown" {
       CONFIG_S3_BUCKET   = var.config_s3_bucket
       CONFIG_S3_KEY      = var.config_s3_key
       OVERRIDE_ENABLED   = var.override_enabled
+      COST_OPTIMIZATION_ENABLED = var.cost_optimization_enabled
+      COST_THRESHOLD_HIGH = var.cost_threshold_high
+      COST_THRESHOLD_REQUIRE_APPROVAL = var.cost_threshold_require_approval
+      BUSINESS_HOURS_START = var.business_hours_start
+      BUSINESS_HOURS_END = var.business_hours_end
+      COST_OPTIMIZED_CLEANUP_WINDOWS = var.cost_optimized_cleanup_windows
+      ENABLE_COST_ANALYSIS = var.enable_cost_analysis
     }
   }
 

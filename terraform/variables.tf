@@ -112,3 +112,53 @@ variable "override_enabled" {
   type        = bool
   default     = false
 }
+
+variable "cost_optimization_enabled" {
+  description = "Enable cost-based scheduling and prioritization"
+  type        = bool
+  default     = true
+}
+
+variable "cost_threshold_high" {
+  description = "Monthly cost threshold (USD) to consider resource as high-value"
+  type        = number
+  default     = 100
+}
+
+variable "cost_threshold_require_approval" {
+  description = "Monthly cost threshold (USD) requiring approval before deletion"
+  type        = number
+  default     = 500
+}
+
+variable "business_hours_start" {
+  description = "Start of business hours (24-hour format) in UTC"
+  type        = number
+  default     = 14  # 9 AM EST
+  validation {
+    condition     = var.business_hours_start >= 0 && var.business_hours_start <= 23
+    error_message = "Business hours start must be between 0 and 23."
+  }
+}
+
+variable "business_hours_end" {
+  description = "End of business hours (24-hour format) in UTC"
+  type        = number
+  default     = 22  # 5 PM EST
+  validation {
+    condition     = var.business_hours_end >= 0 && var.business_hours_end <= 23
+    error_message = "Business hours end must be between 0 and 23."
+  }
+}
+
+variable "cost_optimized_cleanup_windows" {
+  description = "Comma-separated list of hour ranges for cost-optimized cleanup (e.g., '2-6,22-23')"
+  type        = string
+  default     = "2-6,22-23"  # 2-6 AM and 10-11 PM UTC
+}
+
+variable "enable_cost_analysis" {
+  description = "Include cost analysis in cleanup operations and notifications"
+  type        = bool
+  default     = true
+}
