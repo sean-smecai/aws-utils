@@ -19,8 +19,11 @@ from typing import Dict, List, Any, Optional
 MAX_AGE_DAYS = int(os.environ.get('MAX_AGE_DAYS', '3'))
 DRY_RUN = os.environ.get('DRY_RUN', 'false').lower() == 'true'
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', '')
+SCAN_ALL_REGIONS = os.environ.get('SCAN_ALL_REGIONS', 'false').lower() == 'true'
 REGIONS = os.environ.get('REGIONS', 'us-east-1,us-west-2,ap-southeast-2').split(',')
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'minimal')  # minimal|verbose
+ENABLE_WORKSPACES = os.environ.get('ENABLE_WORKSPACES_MONITORING', 'false').lower() == 'true'
+ALWAYS_SEND_NOTIFICATION = os.environ.get('ALWAYS_SEND_NOTIFICATION', 'true').lower() == 'true'
 
 # Cost optimization configuration
 COST_ANALYSIS_ENABLED = os.environ.get('COST_ANALYSIS_ENABLED', 'true').lower() == 'true'
@@ -1485,6 +1488,110 @@ def cleanup_old_elasticsearch_domains(region, summary):
         log_error(f"Failed to scan Elasticsearch domains in {region}", e, region=region)
         summary.setdefault('errors', []).append(f"ES scan {region}: {str(e)}")
 
+def get_all_regions():
+    """Get all available AWS regions dynamically"""
+    try:
+        ec2_client = boto3.client('ec2', region_name='us-east-1')
+        response = ec2_client.describe_regions(AllRegions=False)
+        regions = [region['RegionName'] for region in response['Regions']]
+        structured_log('INFO', f"Discovered {len(regions)} AWS regions", regions=regions)
+        return regions
+    except Exception as e:
+        log_error("Failed to get all regions, using defaults", e)
+        return REGIONS
+
+def shutdown_old_workspaces(region, summary):
+    """Stop old Amazon WorkSpaces"""
+    if not ENABLE_WORKSPACES:
+        return
+    
+    try:
+        # WorkSpaces API is only available in certain regions
+        workspaces_regions = [
+            'us-east-1', 'us-west-2', 'eu-west-1', 'eu-west-2', 
+            'eu-central-1', 'ap-northeast-1', 'ap-northeast-2',
+            'ap-southeast-1', 'ap-southeast-2', 'sa-east-1',
+            'ca-central-1', 'ap-south-1'
+        ]
+        
+        if region not in workspaces_regions:
+            return
+            
+        operation_start = time.time()
+        workspaces_client = boto3.client('workspaces', region_name=region)
+        
+        response = workspaces_client.describe_workspaces()
+        workspaces_stopped = []
+        workspaces_to_stop = []
+        
+        for workspace in response.get('Workspaces', []):
+            try:
+                # Get workspace age from creation time
+                # Note: WorkSpaces don't have a direct creation time, using modification time
+                workspace_id = workspace['WorkspaceId']
+                state = workspace['State']
+                
+                # Skip if already stopped or terminating
+                if state in ['STOPPED', 'STOPPING', 'TERMINATING', 'TERMINATED']:
+                    continue
+                
+                # Check if workspace is old enough (using directory registration as proxy for age)
+                # Since WorkSpaces don't expose creation date, we'll stop based on state
+                # You may want to tag WorkSpaces with creation dates for better tracking
+                
+                # For now, stop all running WorkSpaces if in scope
+                workspaces_to_stop.append({
+                    'WorkspaceId': workspace_id,
+                    'UserName': workspace.get('UserName', 'Unknown'),
+                    'State': state,
+                    'RunningMode': workspace.get('WorkspaceProperties', {}).get('RunningMode', 'Unknown')
+                })
+                
+            except Exception as e:
+                log_error(f"Error processing workspace {workspace_id}", e)
+                continue
+        
+        # Stop workspaces
+        for workspace in workspaces_to_stop:
+            if not DRY_RUN:
+                try:
+                    workspaces_client.stop_workspaces(
+                        StopWorkspaceRequests=[{'WorkspaceId': workspace['WorkspaceId']}]
+                    )
+                    workspaces_stopped.append(workspace)
+                    structured_log('INFO', f"Stopped WorkSpace",
+                                 workspace_id=workspace['WorkspaceId'],
+                                 user=workspace['UserName'])
+                except Exception as e:
+                    log_error(f"Failed to stop workspace {workspace['WorkspaceId']}", e)
+            else:
+                workspaces_stopped.append(workspace)
+                structured_log('INFO', f"[DRY RUN] Would stop WorkSpace",
+                             workspace_id=workspace['WorkspaceId'],
+                             user=workspace['UserName'])
+        
+        # Add to summary
+        if workspaces_stopped:
+            summary.setdefault('workspaces', []).extend([{
+                'region': region,
+                'workspace_id': w['WorkspaceId'],
+                'user': w['UserName'],
+                'state': w['State']
+            } for w in workspaces_stopped])
+        
+        operation_duration = time.time() - operation_start
+        structured_log('INFO', "WorkSpaces scan completed",
+                      region=region,
+                      workspaces_found=len(workspaces_to_stop),
+                      workspaces_stopped=len(workspaces_stopped),
+                      duration_ms=round(operation_duration * 1000, 2))
+        
+    except Exception as e:
+        # WorkSpaces might not be available in this region
+        if 'InvalidAction' not in str(e) and 'UnauthorizedOperation' not in str(e):
+            log_error(f"Failed to scan WorkSpaces in {region}", e, region=region)
+            summary.setdefault('errors', []).append(f"WorkSpaces scan {region}: {str(e)}")
+
 def lambda_handler(event, context):
     """Main Lambda handler"""
     # Initialize performance tracking
@@ -1492,10 +1599,14 @@ def lambda_handler(event, context):
     execution_start = PERFORMANCE_METRICS['start_time']
     
     # Allow overriding config via event payload
-    global MAX_AGE_DAYS, DRY_RUN, CORRELATION_ID
+    global MAX_AGE_DAYS, DRY_RUN, CORRELATION_ID, REGIONS
     
     # Generate new correlation ID for this execution
     CORRELATION_ID = str(uuid.uuid4())
+    
+    # Get regions to scan
+    if SCAN_ALL_REGIONS:
+        REGIONS = get_all_regions()
     
     # Load protection configuration
     load_protection_config()
@@ -1579,6 +1690,9 @@ def lambda_handler(event, context):
             # Elasticsearch/OpenSearch Domains
             cleanup_old_elasticsearch_domains(region, summary)
             
+            # WorkSpaces
+            shutdown_old_workspaces(region, summary)
+            
             # Record region processing time
             region_duration = time.time() - region_start
             PERFORMANCE_METRICS['region_times'][region] = region_duration
@@ -1614,7 +1728,8 @@ def lambda_handler(event, context):
         len(summary['nat_gateways']) +
         len(summary.get('load_balancers', [])) +
         len(summary.get('s3_buckets', [])) +
-        len(summary.get('elasticsearch_domains', []))
+        len(summary.get('elasticsearch_domains', [])) +
+        len(summary.get('workspaces', []))
     )
     
     # Perform cost impact analysis
@@ -1666,8 +1781,8 @@ def lambda_handler(event, context):
         if count > 0:
             publish_cloudwatch_metric(f'{resource_type}ResourcesProcessed', count)
     
-    # Send SNS notification if resources were shut down
-    if total_resources > 0 and SNS_TOPIC_ARN:
+    # Send SNS notification based on configuration
+    if SNS_TOPIC_ARN and (ALWAYS_SEND_NOTIFICATION or total_resources > 0):
         send_notification(summary, total_resources)
     
     return {
@@ -1684,7 +1799,11 @@ def send_notification(summary, total_resources):
     """Send SNS notification with enhanced shutdown summary"""
     sns_client = boto3.client('sns')
     
-    subject = f"AWS Auto-Shutdown: {total_resources} resources {'identified' if DRY_RUN else 'stopped'}"
+    # Adjust subject based on whether resources were found
+    if total_resources == 0:
+        subject = f"AWS Auto-Shutdown: Scan Complete - No Old Resources Found"
+    else:
+        subject = f"AWS Auto-Shutdown: {total_resources} resources {'identified' if DRY_RUN else 'stopped'}"
     
     # Get cost analysis data
     cost_analysis = summary.get('cost_analysis', {})
@@ -1707,6 +1826,7 @@ Resources Summary:
 - Load Balancers: {len(summary.get('load_balancers', []))}
 - S3 Buckets: {len(summary.get('s3_buckets', []))}
 - Elasticsearch Domains: {len(summary.get('elasticsearch_domains', []))}
+- WorkSpaces: {len(summary.get('workspaces', []))}
 
 Cost Analysis:
 - Estimated Monthly Savings: ${monthly_savings:.2f}
@@ -1719,6 +1839,16 @@ Performance Metrics:
 - Average API Latency: {summary.get('performance_metrics', {}).get('average_api_latency_ms', 'N/A')} ms
 
 """
+    
+    # Add status message if no resources found
+    if total_resources == 0:
+        message += """
+✅ STATUS: All Clear!
+No resources older than {} days were found.
+Your AWS account is clean with no abandoned resources.
+
+Regions Scanned: {}
+""".format(MAX_AGE_DAYS, ', '.join(REGIONS[:5]) + ('...' if len(REGIONS) > 5 else ''))
     
     if summary['ec2_instances']:
         message += "\nEC2 Instances:\n"
@@ -1747,6 +1877,13 @@ Performance Metrics:
             message += f"  - {nat['id']} in {nat['region']} - {nat['age_days']} days old\n"
         if len(summary['nat_gateways']) > 10:
             message += f"  ... and {len(summary['nat_gateways']) - 10} more\n"
+    
+    if summary.get('workspaces'):
+        message += "\nWorkSpaces:\n"
+        for ws in summary['workspaces'][:10]:  # Limit to first 10
+            message += f"  - {ws['workspace_id']} ({ws['user']}) in {ws['region']} - State: {ws['state']}\n"
+        if len(summary['workspaces']) > 10:
+            message += f"  ... and {len(summary['workspaces']) - 10} more\n"
     
     if summary['errors']:
         message += f"\nErrors ({len(summary['errors'])}):\n"

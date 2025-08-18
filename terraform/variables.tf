@@ -21,8 +21,14 @@ variable "notification_email" {
   type        = string
 }
 
+variable "scan_all_regions" {
+  description = "Scan all AWS regions instead of specific target regions"
+  type        = bool
+  default     = false
+}
+
 variable "target_regions" {
-  description = "List of AWS regions to scan for old resources"
+  description = "List of AWS regions to scan for old resources (used if scan_all_regions is false)"
   type        = list(string)
   default     = [
     "us-east-1",
@@ -77,6 +83,18 @@ variable "es_domain_exclusions" {
   description = "Comma-separated list of Elasticsearch domain name patterns to exclude from cleanup"
   type        = string
   default     = "production,logs"
+}
+
+variable "enable_workspaces_monitoring" {
+  description = "Enable monitoring and shutdown of Amazon WorkSpaces"
+  type        = bool
+  default     = false
+}
+
+variable "always_send_notification" {
+  description = "Send email notification even when no resources are found"
+  type        = bool
+  default     = true
 }
 
 variable "protection_enabled" {

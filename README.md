@@ -25,6 +25,7 @@ The AWS Auto-Shutdown service helps manage cloud costs by automatically cleaning
 - **Load Balancers**: Removes ELB/ALB/NLB load balancers
 - **S3 Buckets**: Deletes buckets (with safety checks)
 - **Elasticsearch/OpenSearch**: Deletes domains
+- **Amazon WorkSpaces**: Stops running WorkSpaces (when enabled)
 
 ## Quick Start
 
@@ -102,7 +103,10 @@ notification_email = "your-email@example.com"
 |----------|-------------|---------|
 | `max_age_days` | Days before resource shutdown | 3 |
 | `dry_run` | Test mode without stopping resources | "false" |
-| `target_regions` | AWS regions to scan | ["us-east-1", "us-west-2", "ap-southeast-2", "ap-southeast-4", "eu-west-1"] |
+| `scan_all_regions` | Automatically scan ALL AWS regions | false |
+| `target_regions` | AWS regions to scan (if scan_all_regions is false) | ["us-east-1", "us-west-2", "ap-southeast-2", "ap-southeast-4", "eu-west-1"] |
+| `enable_workspaces_monitoring` | Monitor and stop Amazon WorkSpaces | false |
+| `always_send_notification` | Send email even when no resources found | true |
 | `schedule_expression` | CloudWatch Events schedule | "cron(0 22 * * ? *)" |
 | `log_level` | Logging verbosity (minimal/verbose) | "minimal" |
 | `protection_enabled` | Enable resource protection system | true |

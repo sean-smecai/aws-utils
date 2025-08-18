@@ -115,6 +115,10 @@ resource "aws_iam_role_policy" "lambda_policy" {
           "es:DeleteElasticsearchDomain",
           "es:AddTags",
           "es:ListTags",
+          "workspaces:DescribeWorkspaces",
+          "workspaces:StopWorkspaces",
+          "workspaces:TerminateWorkspaces",
+          "workspaces:ModifyWorkspaceProperties",
           "sts:GetCallerIdentity"
         ]
         Resource = "*"
@@ -170,7 +174,10 @@ resource "aws_lambda_function" "auto_shutdown" {
       MAX_AGE_DAYS       = var.max_age_days
       DRY_RUN           = var.dry_run
       SNS_TOPIC_ARN     = aws_sns_topic.notifications.arn
+      SCAN_ALL_REGIONS  = var.scan_all_regions ? "true" : "false"
       REGIONS           = join(",", var.target_regions)
+      ENABLE_WORKSPACES_MONITORING = var.enable_workspaces_monitoring ? "true" : "false"
+      ALWAYS_SEND_NOTIFICATION = var.always_send_notification ? "true" : "false"
       LOG_LEVEL         = var.log_level
       S3_BUCKET_EXCLUSIONS = var.s3_bucket_exclusions
       ELB_NAME_EXCLUSIONS  = var.elb_name_exclusions

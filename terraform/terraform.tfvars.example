@@ -15,6 +15,11 @@ max_age_days = 3
 dry_run = "false"
 
 # AWS regions to scan for old resources
+# Set scan_all_regions to true to automatically scan ALL AWS regions
+# Or specify specific regions in target_regions list
+scan_all_regions = true
+
+# If scan_all_regions is false, these specific regions will be scanned
 target_regions = [
   "us-east-1",
   "us-west-2", 
@@ -37,3 +42,11 @@ enable_slack_notifications = false
 # Logging level (default: minimal)
 # Set to "verbose" for detailed logging, "minimal" for free tier optimization
 log_level = "minimal"
+
+# Enable WorkSpaces monitoring and shutdown
+# WorkSpaces can be expensive if left running
+enable_workspaces_monitoring = true
+
+# Always send email notification even when no resources found
+# Set to false to only get emails when resources are shut down
+always_send_notification = true
