@@ -62,6 +62,146 @@ The AWS Auto-Shutdown service helps manage cloud costs by automatically cleaning
 
 ## Architecture
 
+### Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph TriggerLayer[Trigger Layer]
+        EB[EventBridge Scheduler<br/>Daily @ 10PM UTC]
+    end
+
+    subgraph ComputeLayer[Compute Layer]
+        LF[Lambda Function<br/>Python 3.11<br/>aws-auto-shutdown]
+    end
+
+    subgraph AWSRegions[AWS Regions]
+        direction TB
+        R1[Region 1<br/>us-east-1]
+        R2[Region 2<br/>us-west-2]
+        R3[Region N<br/>eu-north-1]
+        RD[Dynamic Discovery<br/>All Regions]
+    end
+
+    subgraph TargetResources[Target Resources]
+        direction LR
+        EC2[EC2 Instances]
+        RDS[RDS Databases]
+        ECS[ECS Services]
+        NAT[NAT Gateways]
+        ELB[Load Balancers]
+        S3B[S3 Buckets]
+        ES[Elasticsearch]
+        WS[WorkSpaces]
+    end
+
+    subgraph ProtectionSystem[Protection System]
+        PF[Protection Filters<br/>- Blacklist Patterns<br/>- Protected Tags<br/>- Free Tier Check]
+    end
+
+    subgraph NotificationLayer[Notification Layer]
+        SNS[SNS Topic]
+        EMAIL[Email Notifications<br/>- Summary Report<br/>- Cost Analysis<br/>- Resources Affected]
+    end
+
+    subgraph MonitoringStorage[Monitoring & Storage]
+        CW[CloudWatch Logs<br/>14-day retention]
+        CWM[CloudWatch Metrics<br/>Performance & Costs]
+        S3[S3 Backend<br/>Terraform State]
+    end
+
+    EB -->|Triggers| LF
+    LF -->|Discovers| RD
+    RD -->|Scans| R1
+    RD -->|Scans| R2
+    RD -->|Scans| R3
+    
+    R1 --> EC2
+    R1 --> RDS
+    R1 --> ECS
+    R1 --> NAT
+    R1 --> ELB
+    R1 --> S3B
+    R1 --> ES
+    R1 --> WS
+    
+    EC2 -->|Check| PF
+    RDS -->|Check| PF
+    ECS -->|Check| PF
+    NAT -->|Check| PF
+    ELB -->|Check| PF
+    S3B -->|Check| PF
+    ES -->|Check| PF
+    WS -->|Check| PF
+    
+    PF -->|Stop/Delete| EC2
+    PF -->|Stop| RDS
+    PF -->|Scale to 0| ECS
+    PF -->|Delete| NAT
+    PF -->|Delete| ELB
+    PF -->|Delete| S3B
+    PF -->|Delete| ES
+    PF -->|Stop| WS
+    
+    LF -->|Publishes| SNS
+    SNS -->|Sends| EMAIL
+    LF -->|Logs| CW
+    LF -->|Metrics| CWM
+    
+    style EB fill:#ff9900,stroke:#333,stroke-width:2px,color:#fff
+    style LF fill:#ff9900,stroke:#333,stroke-width:2px,color:#fff
+    style SNS fill:#ff4b4b,stroke:#333,stroke-width:2px,color:#fff
+    style PF fill:#4CAF50,stroke:#333,stroke-width:2px,color:#fff
+    style RD fill:#2196F3,stroke:#333,stroke-width:2px,color:#fff
+```
+
+### Resource Flow Diagram
+
+```mermaid
+sequenceDiagram
+    participant EB as EventBridge
+    participant Lambda as Lambda Function
+    participant Regions as AWS Regions
+    participant Resources as Resources
+    participant Protection as Protection System
+    participant SNS as SNS Topic
+    participant User as User Email
+
+    EB->>Lambda: Trigger (Daily)
+    Lambda->>Lambda: Load Configuration
+    
+    alt Scan All Regions = true
+        Lambda->>Regions: Discover All Regions
+        Regions-->>Lambda: Return Region List
+    else Use Target Regions
+        Lambda->>Lambda: Use Configured Regions
+    end
+    
+    loop For Each Region
+        Lambda->>Resources: Scan EC2, RDS, ECS, etc.
+        Resources-->>Lambda: Return Resource List
+        
+        loop For Each Resource
+            Lambda->>Protection: Check Protection Rules
+            Protection-->>Lambda: Allow/Block Decision
+            
+            alt Resource Not Protected & Age > Threshold
+                Lambda->>Resources: Stop/Delete Resource
+                Resources-->>Lambda: Confirmation
+            end
+        end
+    end
+    
+    Lambda->>Lambda: Generate Summary Report
+    Lambda->>SNS: Send Notification
+    SNS->>User: Email Report
+    
+    alt No Resources Found
+        SNS->>User: "All Clear" Status Email
+    else Resources Stopped
+        SNS->>User: Detailed Action Report
+    end
+```
+
 ### Components
 
 1. **Lambda Function** (`terraform/lambda_function.py`)
