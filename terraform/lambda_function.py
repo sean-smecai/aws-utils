@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 AWS Auto-Shutdown Lambda Function
-Stops EC2 instances, RDS instances, and other resources running longer than specified days
+Stops EC2 instances, RDS instances, and tags other resources running longer than specified days
+Note: This function only stops/tags resources, it does not delete anything
 """
 
 import boto3
@@ -32,7 +33,7 @@ COST_PRIORITY_THRESHOLD = float(os.environ.get('COST_PRIORITY_THRESHOLD', '50'))
 SCHEDULING_MODE = os.environ.get('SCHEDULING_MODE', 'cost_optimized')  # cost_optimized|aggressive|conservative
 BUSINESS_HOURS_ONLY = os.environ.get('BUSINESS_HOURS_ONLY', 'false').lower() == 'true'
 
-# Exclusion patterns for resource protection
+# Exclusion patterns for resource protection (for tagging)
 S3_BUCKET_EXCLUSIONS = os.environ.get('S3_BUCKET_EXCLUSIONS', 'terraform-state,cloudtrail,logs,backup').split(',')
 ELB_NAME_EXCLUSIONS = os.environ.get('ELB_NAME_EXCLUSIONS', 'production,critical').split(',')
 ES_DOMAIN_EXCLUSIONS = os.environ.get('ES_DOMAIN_EXCLUSIONS', 'production,logs').split(',')
@@ -594,8 +595,8 @@ def shutdown_old_ecs_services(ecs_client, region, summary):
         log_error(f"Failed to scan ECS services in {region}", e, region=region)
         summary['errors'].append(f"ECS scan {region}: {str(e)}")
 
-def cleanup_nat_gateways(ec2_client, region, summary):
-    """Delete NAT Gateways older than MAX_AGE_DAYS"""
+def tag_old_nat_gateways(ec2_client, region, summary):
+    """Tag NAT Gateways older than MAX_AGE_DAYS (no deletion)"""
     operation_start = time.time()
     
     structured_log('INFO', "Scanning NAT Gateways",
@@ -611,7 +612,7 @@ def cleanup_nat_gateways(ec2_client, region, summary):
         log_performance('nat_describe_gateways', time.time() - api_start, region=region)
         
         gateways_processed = 0
-        gateways_deleted = 0
+        gateways_tagged = 0
         
         for nat in response['NatGateways']:
             gateways_processed += 1
@@ -640,55 +641,63 @@ def cleanup_nat_gateways(ec2_client, region, summary):
                 
                 if not DRY_RUN:
                     try:
-                        delete_start = time.time()
-                        ec2_client.delete_nat_gateway(NatGatewayId=nat_id)
+                        tag_start = time.time()
+                        # Tag the NAT Gateway instead of deleting
+                        ec2_client.create_tags(
+                            Resources=[nat_id],
+                            Tags=[
+                                {'Key': 'AutoShutdown', 'Value': datetime.now(timezone.utc).strftime('%Y-%m-%d')},
+                                {'Key': 'AutoShutdownReason', 'Value': f'Running-for-{age_days}-days'},
+                                {'Key': 'ShouldReview', 'Value': 'true'}
+                            ]
+                        )
                         
-                        delete_duration = time.time() - delete_start
-                        log_performance('nat_delete_gateway', delete_duration,
+                        tag_duration = time.time() - tag_start
+                        log_performance('nat_tag_gateway', tag_duration,
                                       nat_id=nat_id, region=region)
                         
-                        gateways_deleted += 1
+                        gateways_tagged += 1
                         
-                        structured_log('INFO', "NAT Gateway deleted successfully",
+                        structured_log('INFO', "NAT Gateway tagged for review",
                                      resource_type='nat_gateway',
                                      resource_id=nat_id,
                                      region=region,
                                      age_days=age_days,
-                                     action='deleted',
-                                     duration_ms=round(delete_duration * 1000, 2))
+                                     action='tagged',
+                                     duration_ms=round(tag_duration * 1000, 2))
                         
                         # Publish success metric
-                        publish_cloudwatch_metric('NATGatewaysDeleted', 1,
+                        publish_cloudwatch_metric('NATGatewaysTagged', 1,
                                                  dimensions=[
                                                      {'Name': 'Region', 'Value': region},
                                                      {'Name': 'VpcId', 'Value': nat.get('VpcId', 'unknown')}
                                                  ])
                     except Exception as e:
-                        log_error(f"Failed to delete NAT Gateway", e,
+                        log_error(f"Failed to tag NAT Gateway", e,
                                 resource_type='nat_gateway',
                                 resource_id=nat_id,
                                 region=region)
                         summary['errors'].append(f"NAT {nat_id}: {str(e)}")
                         
                         # Publish failure metric
-                        publish_cloudwatch_metric('NATGatewaysFailedToDelete', 1,
+                        publish_cloudwatch_metric('NATGatewaysFailedToTag', 1,
                                                  dimensions=[
                                                      {'Name': 'Region', 'Value': region},
                                                      {'Name': 'ErrorType', 'Value': type(e).__name__}
                                                  ])
                 else:
-                    gateways_deleted += 1  # Count for dry-run
+                    gateways_tagged += 1  # Count for dry-run
         
         # Log operation summary
         operation_duration = time.time() - operation_start
         structured_log('INFO', "NAT Gateway scan completed",
                       region=region,
                       gateways_processed=gateways_processed,
-                      gateways_deleted=gateways_deleted,
+                      gateways_tagged=gateways_tagged,
                       duration_ms=round(operation_duration * 1000, 2))
         
         # Update performance metrics
-        PERFORMANCE_METRICS['resource_counts']['nat'] += gateways_deleted
+        PERFORMANCE_METRICS['resource_counts']['nat'] += gateways_tagged
         
     except Exception as e:
         log_error(f"Failed to scan NAT Gateways in {region}", e, region=region)
@@ -1067,8 +1076,8 @@ def is_resource_excluded(resource_name: str, exclusion_patterns: List[str]) -> b
             return True
     return False
 
-def cleanup_old_load_balancers(region, summary):
-    """Delete ELB/ALB load balancers older than MAX_AGE_DAYS"""
+def tag_old_load_balancers(region, summary):
+    """Tag ELB/ALB load balancers older than MAX_AGE_DAYS (no deletion)"""
     operation_start = time.time()
     
     structured_log('INFO', "Scanning Load Balancers",
@@ -1084,7 +1093,7 @@ def cleanup_old_load_balancers(region, summary):
         log_performance('elbv2_describe_load_balancers', time.time() - api_start, region=region)
         
         lb_processed = 0
-        lb_deleted = 0
+        lb_tagged = 0
         
         for lb in response['LoadBalancers']:
             lb_processed += 1
@@ -1125,55 +1134,63 @@ def cleanup_old_load_balancers(region, summary):
                 
                 if not DRY_RUN:
                     try:
-                        delete_start = time.time()
-                        elbv2_client.delete_load_balancer(LoadBalancerArn=lb_arn)
+                        tag_start = time.time()
+                        # Tag the load balancer instead of deleting
+                        elbv2_client.add_tags(
+                            ResourceArns=[lb_arn],
+                            Tags=[
+                                {'Key': 'AutoShutdown', 'Value': datetime.now(timezone.utc).strftime('%Y-%m-%d')},
+                                {'Key': 'AutoShutdownReason', 'Value': f'Running-for-{age_days}-days'},
+                                {'Key': 'ShouldReview', 'Value': 'true'}
+                            ]
+                        )
                         
-                        delete_duration = time.time() - delete_start
-                        log_performance('elbv2_delete_load_balancer', delete_duration,
+                        tag_duration = time.time() - tag_start
+                        log_performance('elbv2_tag_load_balancer', tag_duration,
                                       lb_name=lb_name, region=region)
                         
-                        lb_deleted += 1
+                        lb_tagged += 1
                         
-                        structured_log('INFO', "Load balancer deleted successfully",
+                        structured_log('INFO', "Load balancer tagged for review",
                                      resource_type='alb',
                                      resource_id=lb_name,
                                      region=region,
                                      age_days=age_days,
-                                     action='deleted',
-                                     duration_ms=round(delete_duration * 1000, 2))
+                                     action='tagged',
+                                     duration_ms=round(tag_duration * 1000, 2))
                         
                         # Publish success metric
-                        publish_cloudwatch_metric('LoadBalancersDeleted', 1,
+                        publish_cloudwatch_metric('LoadBalancersTagged', 1,
                                                  dimensions=[
                                                      {'Name': 'Region', 'Value': region},
                                                      {'Name': 'Type', 'Value': lb['Type']}
                                                  ])
                     except Exception as e:
-                        log_error(f"Failed to delete load balancer", e,
+                        log_error(f"Failed to tag load balancer", e,
                                 resource_type='alb',
                                 resource_id=lb_name,
                                 region=region)
                         summary.setdefault('errors', []).append(f"ALB {lb_name}: {str(e)}")
                         
                         # Publish failure metric
-                        publish_cloudwatch_metric('LoadBalancersFailedToDelete', 1,
+                        publish_cloudwatch_metric('LoadBalancersFailedToTag', 1,
                                                  dimensions=[
                                                      {'Name': 'Region', 'Value': region},
                                                      {'Name': 'ErrorType', 'Value': type(e).__name__}
                                                  ])
                 else:
-                    lb_deleted += 1  # Count for dry-run
+                    lb_tagged += 1  # Count for dry-run
         
         # Log operation summary
         operation_duration = time.time() - operation_start
         structured_log('INFO', "Load balancer scan completed",
                       region=region,
                       lb_processed=lb_processed,
-                      lb_deleted=lb_deleted,
+                      lb_tagged=lb_tagged,
                       duration_ms=round(operation_duration * 1000, 2))
         
         # Update performance metrics
-        PERFORMANCE_METRICS['resource_counts']['elb'] = lb_deleted
+        PERFORMANCE_METRICS['resource_counts']['elb'] = lb_tagged
         
     except Exception as e:
         log_error(f"Failed to scan load balancers in {region}", e, region=region)
@@ -1206,26 +1223,35 @@ def cleanup_old_load_balancers(region, summary):
                 
                 if not DRY_RUN:
                     try:
-                        elb_client.delete_load_balancer(LoadBalancerName=lb_name)
-                        lb_deleted += 1
-                        structured_log('INFO', "Classic ELB deleted",
+                        # Classic ELB uses different tagging API
+                        elb_client.add_tags(
+                            LoadBalancerNames=[lb_name],
+                            Tags=[
+                                {'Key': 'AutoShutdown', 'Value': datetime.now(timezone.utc).strftime('%Y-%m-%d')},
+                                {'Key': 'AutoShutdownReason', 'Value': f'Running-for-{age_days}-days'},
+                                {'Key': 'ShouldReview', 'Value': 'true'}
+                            ]
+                        )
+                        lb_tagged += 1
+                        structured_log('INFO', "Classic ELB tagged for review",
                                      resource_type='elb_classic',
                                      resource_id=lb_name,
                                      region=region,
-                                     age_days=age_days)
+                                     age_days=age_days,
+                                     action='tagged')
                     except Exception as e:
-                        log_error(f"Failed to delete classic ELB", e,
+                        log_error(f"Failed to tag classic ELB", e,
                                 resource_type='elb_classic',
                                 resource_id=lb_name,
                                 region=region)
                 else:
-                    lb_deleted += 1
+                    lb_tagged += 1
                     
     except Exception as e:
         log_error(f"Failed to scan classic ELBs in {region}", e, region=region)
 
-def cleanup_old_s3_buckets(summary):
-    """Delete S3 buckets older than MAX_AGE_DAYS (S3 is global but accessed via regions)"""
+def tag_old_s3_buckets(summary):
+    """Tag S3 buckets older than MAX_AGE_DAYS (no deletion)"""
     operation_start = time.time()
     
     structured_log('INFO', "Scanning S3 buckets",
@@ -1239,7 +1265,7 @@ def cleanup_old_s3_buckets(summary):
         log_performance('s3_list_buckets', time.time() - api_start)
         
         buckets_processed = 0
-        buckets_deleted = 0
+        buckets_tagged = 0
         
         for bucket in response['Buckets']:
             buckets_processed += 1
@@ -1279,79 +1305,65 @@ def cleanup_old_s3_buckets(summary):
                 
                 if not DRY_RUN:
                     try:
-                        # First, try to empty the bucket (only if it's small)
-                        delete_start = time.time()
-                        try:
-                            # List objects (limit to check if empty or small)
-                            objects = s3_client.list_objects_v2(Bucket=bucket_name, MaxKeys=100)
-                            
-                            if 'Contents' in objects and len(objects['Contents']) > 0:
-                                if len(objects['Contents']) < 100:  # Only auto-delete if small bucket
-                                    # Delete objects
-                                    delete_objects = {'Objects': [{'Key': obj['Key']} for obj in objects['Contents']]}
-                                    s3_client.delete_objects(Bucket=bucket_name, Delete=delete_objects)
-                                    structured_log('INFO', f"Emptied small S3 bucket",
-                                                 resource_id=bucket_name,
-                                                 object_count=len(objects['Contents']))
-                                else:
-                                    # Skip large buckets
-                                    structured_log('WARNING', f"S3 bucket not empty, skipping",
-                                                 resource_id=bucket_name,
-                                                 reason='bucket_not_empty')
-                                    summary.setdefault('errors', []).append(f"S3 {bucket_name}: Bucket not empty (>100 objects)")
-                                    continue
-                        except:
-                            pass  # Bucket might be empty
+                        tag_start = time.time()
+                        # Tag the bucket instead of deleting
+                        s3_client.put_bucket_tagging(
+                            Bucket=bucket_name,
+                            Tagging={
+                                'TagSet': [
+                                    {'Key': 'AutoShutdown', 'Value': datetime.now(timezone.utc).strftime('%Y-%m-%d')},
+                                    {'Key': 'AutoShutdownReason', 'Value': f'Running-for-{age_days}-days'},
+                                    {'Key': 'ShouldReview', 'Value': 'true'}
+                                ]
+                            }
+                        )
                         
-                        # Delete the bucket
-                        s3_client.delete_bucket(Bucket=bucket_name)
+                        tag_duration = time.time() - tag_start
+                        log_performance('s3_tag_bucket', tag_duration, bucket_name=bucket_name)
                         
-                        delete_duration = time.time() - delete_start
-                        log_performance('s3_delete_bucket', delete_duration, bucket_name=bucket_name)
+                        buckets_tagged += 1
                         
-                        buckets_deleted += 1
-                        
-                        structured_log('INFO', "S3 bucket deleted successfully",
+                        structured_log('INFO', "S3 bucket tagged for review",
                                      resource_type='s3',
                                      resource_id=bucket_name,
                                      region=bucket_region,
                                      age_days=age_days,
-                                     action='deleted',
-                                     duration_ms=round(delete_duration * 1000, 2))
+                                     action='tagged',
+                                     duration_ms=round(tag_duration * 1000, 2))
                         
                         # Publish success metric
-                        publish_cloudwatch_metric('S3BucketsDeleted', 1)
+                        publish_cloudwatch_metric('S3BucketsTagged', 1)
                         
                     except Exception as e:
-                        log_error(f"Failed to delete S3 bucket", e,
+                        log_error(f"Failed to tag S3 bucket", e,
                                 resource_type='s3',
                                 resource_id=bucket_name)
                         summary.setdefault('errors', []).append(f"S3 {bucket_name}: {str(e)}")
                         
                         # Publish failure metric
-                        publish_cloudwatch_metric('S3BucketsFailedToDelete', 1,
+                        publish_cloudwatch_metric('S3BucketsFailedToTag', 1,
                                                  dimensions=[
                                                      {'Name': 'ErrorType', 'Value': type(e).__name__}
                                                  ])
                 else:
-                    buckets_deleted += 1  # Count for dry-run
+                    buckets_tagged += 1  # Count for dry-run
         
         # Log operation summary
         operation_duration = time.time() - operation_start
         structured_log('INFO', "S3 scan completed",
                       buckets_processed=buckets_processed,
-                      buckets_deleted=buckets_deleted,
+                      buckets_tagged=buckets_tagged,
                       duration_ms=round(operation_duration * 1000, 2))
         
         # Update performance metrics
-        PERFORMANCE_METRICS['resource_counts']['s3'] = buckets_deleted
+        PERFORMANCE_METRICS['resource_counts']['s3'] = buckets_tagged
         
     except Exception as e:
         log_error(f"Failed to scan S3 buckets", e)
         summary.setdefault('errors', []).append(f"S3 scan: {str(e)}")
 
-def cleanup_old_elasticsearch_domains(region, summary):
-    """Delete Elasticsearch/OpenSearch domains older than MAX_AGE_DAYS"""
+def tag_old_elasticsearch_domains(region, summary):
+    """Tag Elasticsearch/OpenSearch domains older than MAX_AGE_DAYS (no deletion)"""
     operation_start = time.time()
     
     structured_log('INFO', "Scanning Elasticsearch/OpenSearch domains",
@@ -1374,7 +1386,7 @@ def cleanup_old_elasticsearch_domains(region, summary):
         log_performance(f'{service_type}_list_domains', time.time() - api_start, region=region)
         
         domains_processed = 0
-        domains_deleted = 0
+        domains_tagged = 0
         
         for domain_info in response.get('DomainNames', []):
             domains_processed += 1
@@ -1427,47 +1439,62 @@ def cleanup_old_elasticsearch_domains(region, summary):
                     
                     if not DRY_RUN:
                         try:
-                            delete_start = time.time()
+                            tag_start = time.time()
+                            # Tag the domain instead of deleting
                             if service_type == 'opensearch':
-                                es_client.delete_domain(DomainName=domain_name)
+                                es_client.add_tags(
+                                    ARN=domain.get('ARN', domain.get('DomainArn')),
+                                    TagList=[
+                                        {'Key': 'AutoShutdown', 'Value': datetime.now(timezone.utc).strftime('%Y-%m-%d')},
+                                        {'Key': 'AutoShutdownReason', 'Value': f'Running-for-{age_days}-days'},
+                                        {'Key': 'ShouldReview', 'Value': 'true'}
+                                    ]
+                                )
                             else:
-                                es_client.delete_elasticsearch_domain(DomainName=domain_name)
+                                es_client.add_tags(
+                                    ARN=domain.get('ARN', domain.get('DomainArn')),
+                                    TagList=[
+                                        {'Key': 'AutoShutdown', 'Value': datetime.now(timezone.utc).strftime('%Y-%m-%d')},
+                                        {'Key': 'AutoShutdownReason', 'Value': f'Running-for-{age_days}-days'},
+                                        {'Key': 'ShouldReview', 'Value': 'true'}
+                                    ]
+                                )
                             
-                            delete_duration = time.time() - delete_start
-                            log_performance(f'{service_type}_delete_domain', delete_duration,
+                            tag_duration = time.time() - tag_start
+                            log_performance(f'{service_type}_tag_domain', tag_duration,
                                           domain_name=domain_name, region=region)
                             
-                            domains_deleted += 1
+                            domains_tagged += 1
                             
-                            structured_log('INFO', f"{service_type.title()} domain deleted successfully",
+                            structured_log('INFO', f"{service_type.title()} domain tagged for review",
                                          resource_type=service_type,
                                          resource_id=domain_name,
                                          region=region,
                                          age_days=age_days,
-                                         action='deleted',
-                                         duration_ms=round(delete_duration * 1000, 2))
+                                         action='tagged',
+                                         duration_ms=round(tag_duration * 1000, 2))
                             
                             # Publish success metric
-                            publish_cloudwatch_metric('ElasticsearchDomainsDeleted', 1,
+                            publish_cloudwatch_metric('ElasticsearchDomainsTagged', 1,
                                                      dimensions=[
                                                          {'Name': 'Region', 'Value': region},
                                                          {'Name': 'ServiceType', 'Value': service_type}
                                                      ])
                         except Exception as e:
-                            log_error(f"Failed to delete {service_type} domain", e,
+                            log_error(f"Failed to tag {service_type} domain", e,
                                     resource_type=service_type,
                                     resource_id=domain_name,
                                     region=region)
                             summary.setdefault('errors', []).append(f"ES {domain_name}: {str(e)}")
                             
                             # Publish failure metric
-                            publish_cloudwatch_metric('ElasticsearchDomainsFailedToDelete', 1,
+                            publish_cloudwatch_metric('ElasticsearchDomainsFailedToTag', 1,
                                                      dimensions=[
                                                          {'Name': 'Region', 'Value': region},
                                                          {'Name': 'ErrorType', 'Value': type(e).__name__}
                                                      ])
                     else:
-                        domains_deleted += 1  # Count for dry-run
+                        domains_tagged += 1  # Count for dry-run
                         
             except Exception as e:
                 log_error(f"Failed to describe {service_type} domain {domain_name}", e,
@@ -1478,11 +1505,11 @@ def cleanup_old_elasticsearch_domains(region, summary):
         structured_log('INFO', f"{service_type.title()} scan completed",
                       region=region,
                       domains_processed=domains_processed,
-                      domains_deleted=domains_deleted,
+                      domains_tagged=domains_tagged,
                       duration_ms=round(operation_duration * 1000, 2))
         
         # Update performance metrics
-        PERFORMANCE_METRICS['resource_counts']['elasticsearch'] = domains_deleted
+        PERFORMANCE_METRICS['resource_counts']['elasticsearch'] = domains_tagged
         
     except Exception as e:
         log_error(f"Failed to scan Elasticsearch domains in {region}", e, region=region)
@@ -1682,13 +1709,13 @@ def lambda_handler(event, context):
             shutdown_old_ecs_services(ecs_client, region, summary)
             
             # NAT Gateways
-            cleanup_nat_gateways(ec2_client, region, summary)
+            tag_old_nat_gateways(ec2_client, region, summary)
             
             # Load Balancers (ELB/ALB/NLB)
-            cleanup_old_load_balancers(region, summary)
+            tag_old_load_balancers(region, summary)
             
             # Elasticsearch/OpenSearch Domains
-            cleanup_old_elasticsearch_domains(region, summary)
+            tag_old_elasticsearch_domains(region, summary)
             
             # WorkSpaces
             shutdown_old_workspaces(region, summary)
@@ -1711,7 +1738,7 @@ def lambda_handler(event, context):
     
     # S3 buckets are global, process them once after all regions
     try:
-        cleanup_old_s3_buckets(summary)
+        tag_old_s3_buckets(summary)
     except Exception as e:
         log_error("Failed to process S3 buckets", e)
         summary['errors'].append(f"S3 buckets: {str(e)}")
@@ -1788,7 +1815,7 @@ def lambda_handler(event, context):
     return {
         'statusCode': 200,
         'body': json.dumps({
-            'message': f"Auto-shutdown completed. {total_resources} resources processed.",
+            'message': f"Auto-shutdown completed. {total_resources} resources stopped/tagged.",
             'correlation_id': CORRELATION_ID,
             'dry_run': DRY_RUN,
             'summary': summary
@@ -1803,7 +1830,7 @@ def send_notification(summary, total_resources):
     if total_resources == 0:
         subject = f"AWS Auto-Shutdown: Scan Complete - No Old Resources Found"
     else:
-        subject = f"AWS Auto-Shutdown: {total_resources} resources {'identified' if DRY_RUN else 'stopped'}"
+        subject = f"AWS Auto-Shutdown: {total_resources} resources {'identified' if DRY_RUN else 'stopped/tagged'}"
     
     # Get cost analysis data
     cost_analysis = summary.get('cost_analysis', {})
@@ -1819,14 +1846,14 @@ Max Age: {MAX_AGE_DAYS} days
 Scheduling Mode: {SCHEDULING_MODE}
 
 Resources Summary:
-- EC2 Instances: {len(summary['ec2_instances'])}
-- RDS Instances: {len(summary['rds_instances'])}
-- ECS Services: {len(summary['ecs_services'])}
-- NAT Gateways: {len(summary['nat_gateways'])}
-- Load Balancers: {len(summary.get('load_balancers', []))}
-- S3 Buckets: {len(summary.get('s3_buckets', []))}
-- Elasticsearch Domains: {len(summary.get('elasticsearch_domains', []))}
-- WorkSpaces: {len(summary.get('workspaces', []))}
+- EC2 Instances (Stopped): {len(summary['ec2_instances'])}
+- RDS Instances (Stopped): {len(summary['rds_instances'])}
+- ECS Services (Scaled to 0): {len(summary['ecs_services'])}
+- NAT Gateways (Tagged): {len(summary['nat_gateways'])}
+- Load Balancers (Tagged): {len(summary.get('load_balancers', []))}
+- S3 Buckets (Tagged): {len(summary.get('s3_buckets', []))}
+- Elasticsearch Domains (Tagged): {len(summary.get('elasticsearch_domains', []))}
+- WorkSpaces (Stopped): {len(summary.get('workspaces', []))}
 
 Cost Analysis:
 - Estimated Monthly Savings: ${monthly_savings:.2f}
@@ -1872,7 +1899,7 @@ Regions Scanned: {}
             message += f"  ... and {len(summary['ecs_services']) - 10} more\n"
     
     if summary['nat_gateways']:
-        message += "\nNAT Gateways:\n"
+        message += "\nNAT Gateways (Tagged for Review):\n"
         for nat in summary['nat_gateways'][:10]:  # Limit to first 10
             message += f"  - {nat['id']} in {nat['region']} - {nat['age_days']} days old\n"
         if len(summary['nat_gateways']) > 10:
@@ -1894,10 +1921,14 @@ Regions Scanned: {}
     
     if not DRY_RUN:
         message += """
-To restart resources:
+To restart stopped resources:
 - EC2: aws ec2 start-instances --instance-ids <instance-id>
 - RDS: aws rds start-db-instance --db-instance-identifier <db-id>
 - ECS: aws ecs update-service --cluster <cluster> --service <service> --desired-count <count>
+- WorkSpaces: aws workspaces start-workspaces --start-workspace-requests WorkspaceId=<workspace-id>
+
+Tagged resources (NAT Gateways, Load Balancers, S3, Elasticsearch) have been marked for review.
+They remain fully operational but should be evaluated for continued use.
 """
     
     message += f"""
