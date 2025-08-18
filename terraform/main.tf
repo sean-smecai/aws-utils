@@ -175,6 +175,11 @@ resource "aws_lambda_function" "auto_shutdown" {
       S3_BUCKET_EXCLUSIONS = var.s3_bucket_exclusions
       ELB_NAME_EXCLUSIONS  = var.elb_name_exclusions
       ES_DOMAIN_EXCLUSIONS = var.es_domain_exclusions
+      PROTECTION_ENABLED = var.protection_enabled
+      CONFIG_SOURCE      = var.config_source
+      CONFIG_S3_BUCKET   = var.config_s3_bucket
+      CONFIG_S3_KEY      = var.config_s3_key
+      OVERRIDE_ENABLED   = var.override_enabled
     }
   }
 

@@ -1,0 +1,68 @@
+{
+  "ec2": {
+    "whitelist_patterns": ["bastion-*", "jenkins-*"],
+    "blacklist_patterns": ["*production*", "*critical*", "*do-not-delete*"],
+    "protected_tags": {
+      "Environment": ["production", "prod", "staging"],
+      "Protected": ["true", "yes", "1"],
+      "ManagedBy": ["terraform", "cloudformation", "ansible"],
+      "Owner": ["admin", "devops"]
+    },
+    "protected_instance_types": ["t2.micro", "t3.micro", "t2.small"],
+    "regex_patterns": ["^prod-", "^staging-", "-prod$"],
+    "severity_levels": {
+      "critical": {"action": "never_delete"},
+      "important": {"action": "require_confirmation"},
+      "standard": {"action": "normal"}
+    }
+  },
+  "rds": {
+    "blacklist_patterns": ["*production*", "*master*", "*primary*", "*replica*"],
+    "protected_tags": {
+      "Environment": ["production", "prod", "staging"],
+      "Protected": ["true", "yes", "1"],
+      "Backup": ["required", "critical"]
+    },
+    "protected_engine_types": ["aurora-mysql", "aurora-postgresql"],
+    "regex_patterns": ["^prod-", "^master-", "-prod$"]
+  },
+  "s3": {
+    "blacklist_patterns": [
+      "*terraform-state*", 
+      "*cloudtrail*", 
+      "*logs*", 
+      "*backup*", 
+      "*config*",
+      "*audit*",
+      "*archive*"
+    ],
+    "protected_tags": {
+      "Environment": ["production", "prod"],
+      "Protected": ["true", "yes", "1"],
+      "DataClassification": ["confidential", "restricted"]
+    },
+    "regex_patterns": [
+      "^aws-",
+      "^cloudtrail-",
+      "-prod-",
+      "-production-",
+      "\\d{4}-\\d{2}-\\d{2}"
+    ]
+  },
+  "elb": {
+    "blacklist_patterns": ["*production*", "*critical*", "*public*", "*api*"],
+    "protected_tags": {
+      "Environment": ["production", "prod", "staging"],
+      "Type": ["public", "internet-facing"]
+    },
+    "regex_patterns": ["^prod-", "^api-", "-prod$"]
+  },
+  "elasticsearch": {
+    "blacklist_patterns": ["*production*", "*logs*", "*analytics*", "*monitoring*"],
+    "protected_tags": {
+      "Environment": ["production", "prod"],
+      "Purpose": ["logging", "monitoring", "analytics"]
+    },
+    "regex_patterns": ["^prod-", "^log-", "-prod$"]
+  }
+}

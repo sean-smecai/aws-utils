@@ -78,3 +78,37 @@ variable "es_domain_exclusions" {
   type        = string
   default     = "production,logs"
 }
+
+variable "protection_enabled" {
+  description = "Enable comprehensive protection system for critical resources"
+  type        = bool
+  default     = true
+}
+
+variable "config_source" {
+  description = "Source for protection configuration: env, s3, or default"
+  type        = string
+  default     = "env"
+  validation {
+    condition     = contains(["env", "s3", "default"], var.config_source)
+    error_message = "Config source must be 'env', 's3', or 'default'."
+  }
+}
+
+variable "config_s3_bucket" {
+  description = "S3 bucket containing protection configuration (if config_source is s3)"
+  type        = string
+  default     = ""
+}
+
+variable "config_s3_key" {
+  description = "S3 key for protection configuration file"
+  type        = string
+  default     = "protection-config.json"
+}
+
+variable "override_enabled" {
+  description = "Enable emergency override capability for protected resources"
+  type        = bool
+  default     = false
+}

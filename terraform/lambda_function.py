@@ -7,6 +7,7 @@ Stops EC2 instances, RDS instances, and other resources running longer than spec
 import boto3
 import json
 import os
+import re
 import time
 import traceback
 import uuid
@@ -38,6 +39,67 @@ PERFORMANCE_METRICS = {
     'region_times': {},
     'resource_counts': defaultdict(int),
     'api_call_latencies': []
+}
+
+# Protection configuration
+PROTECTION_CONFIG = {
+    'enabled': os.environ.get('PROTECTION_ENABLED', 'true').lower() == 'true',
+    'config_source': os.environ.get('CONFIG_SOURCE', 'env'),  # env, s3, default
+    's3_config_bucket': os.environ.get('CONFIG_S3_BUCKET', ''),
+    's3_config_key': os.environ.get('CONFIG_S3_KEY', 'protection-config.json'),
+    'override_enabled': os.environ.get('OVERRIDE_ENABLED', 'false').lower() == 'true',
+    'rules': {}
+}
+
+# Default protection rules
+DEFAULT_PROTECTION_RULES = {
+    'ec2': {
+        'whitelist_patterns': [],  # Resources to always protect
+        'blacklist_patterns': ['*production*', '*critical*', '*do-not-delete*'],
+        'protected_tags': {
+            'Environment': ['production', 'prod'],
+            'Protected': ['true', 'yes', '1'],
+            'ManagedBy': ['terraform', 'cloudformation']
+        },
+        'protected_instance_types': ['t2.micro', 't3.micro'],  # Free tier instances
+        'regex_patterns': [],
+        'severity_levels': {
+            'critical': {'action': 'never_delete'},
+            'important': {'action': 'require_confirmation'},
+            'standard': {'action': 'normal'}
+        }
+    },
+    'rds': {
+        'blacklist_patterns': ['*production*', '*master*', '*primary*'],
+        'protected_tags': {
+            'Environment': ['production', 'prod'],
+            'Protected': ['true', 'yes', '1']
+        },
+        'protected_engine_types': [],
+        'regex_patterns': []
+    },
+    's3': {
+        'blacklist_patterns': ['*terraform-state*', '*cloudtrail*', '*logs*', '*backup*', '*config*'],
+        'protected_tags': {
+            'Environment': ['production', 'prod'],
+            'Protected': ['true', 'yes', '1']
+        },
+        'regex_patterns': [r'^aws-', r'-prod-', r'-production-']
+    },
+    'elb': {
+        'blacklist_patterns': ['*production*', '*critical*', '*public*'],
+        'protected_tags': {
+            'Environment': ['production', 'prod']
+        },
+        'regex_patterns': []
+    },
+    'elasticsearch': {
+        'blacklist_patterns': ['*production*', '*logs*', '*analytics*'],
+        'protected_tags': {
+            'Environment': ['production', 'prod']
+        },
+        'regex_patterns': []
+    }
 }
 
 def structured_log(level: str, message: str, **kwargs) -> None:
@@ -145,6 +207,28 @@ def shutdown_old_ec2_instances(ec2_client, region, summary):
                 # Get instance name tag
                 name = next((tag['Value'] for tag in instance.get('Tags', []) 
                             if tag['Key'] == 'Name'), 'Unnamed')
+                
+                # Get all tags as dictionary
+                tags_dict = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+                
+                # Check protection status
+                is_protected, protection_reason = is_resource_protected(
+                    'ec2', 
+                    name, 
+                    instance_id,
+                    tags_dict,
+                    {'instance_type': instance['InstanceType']}
+                )
+                
+                if is_protected:
+                    structured_log('INFO', "EC2 instance protected from cleanup",
+                                 resource_type='ec2',
+                                 resource_id=instance_id,
+                                 resource_name=name,
+                                 region=region,
+                                 age_days=age_days,
+                                 protection_reason=protection_reason)
+                    continue
                 
                 # Log resource state before action
                 structured_log('DEBUG' if LOG_LEVEL == 'verbose' else 'INFO',
@@ -256,6 +340,33 @@ def shutdown_old_rds_instances(rds_client, region, summary):
                 db_id = db['DBInstanceIdentifier']
                 create_time = db['InstanceCreateTime']
                 age_days = get_age_days(create_time)
+                
+                # Get tags for RDS instance
+                try:
+                    tag_response = rds_client.list_tags_for_resource(
+                        ResourceName=db['DBInstanceArn']
+                    )
+                    tags_dict = {tag['Key']: tag['Value'] for tag in tag_response.get('TagList', [])}
+                except Exception:
+                    tags_dict = {}
+                
+                # Check protection status
+                is_protected, protection_reason = is_resource_protected(
+                    'rds',
+                    db_id,
+                    db['DBInstanceArn'],
+                    tags_dict,
+                    {'engine': db.get('Engine', 'unknown')}
+                )
+                
+                if is_protected:
+                    structured_log('INFO', "RDS instance protected from cleanup",
+                                 resource_type='rds',
+                                 resource_id=db_id,
+                                 region=region,
+                                 age_days=age_days,
+                                 protection_reason=protection_reason)
+                    continue
                 
                 # Log resource state before action
                 structured_log('DEBUG' if LOG_LEVEL == 'verbose' else 'INFO',
@@ -573,8 +684,151 @@ def cleanup_nat_gateways(ec2_client, region, summary):
         log_error(f"Failed to scan NAT Gateways in {region}", e, region=region)
         summary['errors'].append(f"NAT scan {region}: {str(e)}")
 
+def load_protection_config() -> Dict[str, Any]:
+    """Load protection configuration from various sources"""
+    global PROTECTION_CONFIG
+    
+    try:
+        if PROTECTION_CONFIG['config_source'] == 's3' and PROTECTION_CONFIG['s3_config_bucket']:
+            # Load from S3
+            structured_log('INFO', "Loading protection config from S3",
+                         bucket=PROTECTION_CONFIG['s3_config_bucket'],
+                         key=PROTECTION_CONFIG['s3_config_key'])
+            
+            s3_client = boto3.client('s3')
+            response = s3_client.get_object(
+                Bucket=PROTECTION_CONFIG['s3_config_bucket'],
+                Key=PROTECTION_CONFIG['s3_config_key']
+            )
+            config_data = json.loads(response['Body'].read())
+            PROTECTION_CONFIG['rules'] = validate_protection_config(config_data)
+            PROTECTION_CONFIG['config_source'] = 's3'
+            
+        elif PROTECTION_CONFIG['config_source'] == 'env':
+            # Load from environment variables
+            structured_log('INFO', "Loading protection config from environment")
+            PROTECTION_CONFIG['rules'] = DEFAULT_PROTECTION_RULES
+            PROTECTION_CONFIG['config_source'] = 'env'
+            
+        else:
+            # Use default configuration
+            structured_log('INFO', "Using default protection config")
+            PROTECTION_CONFIG['rules'] = DEFAULT_PROTECTION_RULES
+            PROTECTION_CONFIG['config_source'] = 'default'
+            
+    except Exception as e:
+        log_error("Failed to load protection config, using defaults", e)
+        PROTECTION_CONFIG['rules'] = DEFAULT_PROTECTION_RULES
+        PROTECTION_CONFIG['config_source'] = 'default_fallback'
+    
+    return PROTECTION_CONFIG
+
+def validate_protection_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate protection configuration structure"""
+    validated = {}
+    
+    for resource_type in ['ec2', 'rds', 's3', 'elb', 'elasticsearch']:
+        if resource_type in config:
+            validated[resource_type] = {
+                'whitelist_patterns': config[resource_type].get('whitelist_patterns', []),
+                'blacklist_patterns': config[resource_type].get('blacklist_patterns', []),
+                'protected_tags': config[resource_type].get('protected_tags', {}),
+                'regex_patterns': config[resource_type].get('regex_patterns', []),
+                'severity_levels': config[resource_type].get('severity_levels', {})
+            }
+        else:
+            # Use defaults if resource type not in config
+            validated[resource_type] = DEFAULT_PROTECTION_RULES.get(resource_type, {})
+    
+    return validated
+
+def match_pattern(value: str, pattern: str) -> bool:
+    """Match a value against a pattern (supports wildcards)"""
+    if not value or not pattern:
+        return False
+    
+    # Convert wildcard pattern to regex
+    if '*' in pattern:
+        regex_pattern = pattern.replace('*', '.*')
+        regex_pattern = f'^{regex_pattern}$'
+        return bool(re.match(regex_pattern, value, re.IGNORECASE))
+    
+    # Exact match (case-insensitive)
+    return value.lower() == pattern.lower()
+
+def match_regex_patterns(value: str, patterns: List[str]) -> bool:
+    """Check if value matches any regex pattern"""
+    for pattern in patterns:
+        try:
+            if re.search(pattern, value, re.IGNORECASE):
+                return True
+        except re.error:
+            structured_log('WARNING', f"Invalid regex pattern: {pattern}")
+    return False
+
+def check_tag_protection(tags: Dict[str, str], protected_tags: Dict[str, List[str]]) -> tuple[bool, str]:
+    """Check if resource tags indicate protection"""
+    if not tags or not protected_tags:
+        return False, ""
+    
+    for tag_key, protected_values in protected_tags.items():
+        if tag_key in tags:
+            tag_value = tags[tag_key].lower()
+            for protected_value in protected_values:
+                if tag_value == protected_value.lower():
+                    return True, f"Protected by tag {tag_key}={tags[tag_key]}"
+    
+    return False, ""
+
+def is_resource_protected(resource_type: str, resource_name: str, 
+                         resource_id: str = None, tags: Dict[str, str] = None,
+                         additional_checks: Dict[str, Any] = None) -> tuple[bool, str]:
+    """
+    Comprehensive protection check for resources
+    Returns: (is_protected, reason)
+    """
+    if not PROTECTION_CONFIG['enabled']:
+        return False, ""
+    
+    rules = PROTECTION_CONFIG['rules'].get(resource_type, {})
+    if not rules:
+        return False, ""
+    
+    # Check whitelist (always protect)
+    whitelist = rules.get('whitelist_patterns', [])
+    for pattern in whitelist:
+        if match_pattern(resource_name, pattern):
+            return True, f"Whitelisted by pattern: {pattern}"
+    
+    # Check blacklist (always protect)
+    blacklist = rules.get('blacklist_patterns', [])
+    for pattern in blacklist:
+        if match_pattern(resource_name, pattern):
+            return True, f"Blacklisted by pattern: {pattern}"
+    
+    # Check regex patterns
+    regex_patterns = rules.get('regex_patterns', [])
+    if match_regex_patterns(resource_name, regex_patterns):
+        return True, f"Protected by regex pattern"
+    
+    # Check tag-based protection
+    if tags:
+        protected, reason = check_tag_protection(tags, rules.get('protected_tags', {}))
+        if protected:
+            return True, reason
+    
+    # Resource-specific checks
+    if additional_checks and resource_type == 'ec2':
+        # Check instance type protection
+        instance_type = additional_checks.get('instance_type')
+        protected_types = rules.get('protected_instance_types', [])
+        if instance_type and instance_type in protected_types:
+            return True, f"Protected instance type: {instance_type}"
+    
+    return False, ""
+
 def is_resource_excluded(resource_name: str, exclusion_patterns: List[str]) -> bool:
-    """Check if resource name matches any exclusion pattern"""
+    """Check if resource name matches any exclusion pattern (legacy function)"""
     if not resource_name:
         return False
     
@@ -1016,6 +1270,9 @@ def lambda_handler(event, context):
     
     # Generate new correlation ID for this execution
     CORRELATION_ID = str(uuid.uuid4())
+    
+    # Load protection configuration
+    load_protection_config()
     
     if 'max_age_days' in event:
         MAX_AGE_DAYS = int(event['max_age_days'])
