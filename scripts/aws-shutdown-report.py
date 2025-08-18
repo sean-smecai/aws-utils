@@ -1,4 +1,4 @@
-How do you just#!/usr/bin/env python3
+#!/usr/bin/env python3
 
 """
 AWS Resource Age Report

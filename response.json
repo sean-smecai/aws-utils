@@ -1,1 +1,0 @@
-{"statusCode": 200, "body": "{\"message\": \"Auto-shutdown completed. 0 resources processed.\", \"dry_run\": true, \"summary\": {\"timestamp\": \"2025-08-03T09:47:41.993121+00:00\", \"max_age_days\": 3, \"dry_run\": true, \"ec2_instances\": [], \"rds_instances\": [], \"ecs_services\": [], \"nat_gateways\": [], \"errors\": []}}"}
