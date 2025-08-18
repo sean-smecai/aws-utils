@@ -10,7 +10,7 @@ import os
 import time
 import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from typing import Dict, List, Any, Optional
 
@@ -20,6 +20,11 @@ DRY_RUN = os.environ.get('DRY_RUN', 'false').lower() == 'true'
 SNS_TOPIC_ARN = os.environ.get('SNS_TOPIC_ARN', '')
 REGIONS = os.environ.get('REGIONS', 'us-east-1,us-west-2,ap-southeast-2').split(',')
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'minimal')  # minimal|verbose
+
+# Exclusion patterns for resource protection
+S3_BUCKET_EXCLUSIONS = os.environ.get('S3_BUCKET_EXCLUSIONS', 'terraform-state,cloudtrail,logs,backup').split(',')
+ELB_NAME_EXCLUSIONS = os.environ.get('ELB_NAME_EXCLUSIONS', 'production,critical').split(',')
+ES_DOMAIN_EXCLUSIONS = os.environ.get('ES_DOMAIN_EXCLUSIONS', 'production,logs').split(',')
 
 # CloudWatch metrics client
 cloudwatch = boto3.client('cloudwatch', region_name='us-east-1')
@@ -568,6 +573,438 @@ def cleanup_nat_gateways(ec2_client, region, summary):
         log_error(f"Failed to scan NAT Gateways in {region}", e, region=region)
         summary['errors'].append(f"NAT scan {region}: {str(e)}")
 
+def is_resource_excluded(resource_name: str, exclusion_patterns: List[str]) -> bool:
+    """Check if resource name matches any exclusion pattern"""
+    if not resource_name:
+        return False
+    
+    resource_lower = resource_name.lower()
+    for pattern in exclusion_patterns:
+        if pattern and pattern.lower() in resource_lower:
+            return True
+    return False
+
+def cleanup_old_load_balancers(region, summary):
+    """Delete ELB/ALB load balancers older than MAX_AGE_DAYS"""
+    operation_start = time.time()
+    
+    structured_log('INFO', "Scanning Load Balancers",
+                  region=region,
+                  operation='elb_scan',
+                  max_age_days=MAX_AGE_DAYS)
+    
+    # Handle ELBv2 (ALB/NLB)
+    try:
+        elbv2_client = boto3.client('elbv2', region_name=region)
+        api_start = time.time()
+        response = elbv2_client.describe_load_balancers()
+        log_performance('elbv2_describe_load_balancers', time.time() - api_start, region=region)
+        
+        lb_processed = 0
+        lb_deleted = 0
+        
+        for lb in response['LoadBalancers']:
+            lb_processed += 1
+            lb_name = lb['LoadBalancerName']
+            lb_arn = lb['LoadBalancerArn']
+            created_time = lb['CreatedTime']
+            age_days = get_age_days(created_time)
+            
+            # Check exclusions
+            if is_resource_excluded(lb_name, ELB_NAME_EXCLUSIONS):
+                structured_log('DEBUG', f"Load balancer excluded from cleanup",
+                             resource_type='alb',
+                             resource_id=lb_name,
+                             region=region,
+                             reason='exclusion_pattern_match')
+                continue
+            
+            # Log resource state
+            structured_log('DEBUG' if LOG_LEVEL == 'verbose' else 'INFO',
+                         "Load balancer found",
+                         resource_type='alb',
+                         resource_id=lb_name,
+                         region=region,
+                         age_days=age_days,
+                         type=lb['Type'],
+                         scheme=lb['Scheme'],
+                         state=lb['State']['Code'],
+                         action_required=age_days >= MAX_AGE_DAYS)
+            
+            if age_days >= MAX_AGE_DAYS:
+                summary.setdefault('load_balancers', []).append({
+                    'name': lb_name,
+                    'arn': lb_arn,
+                    'type': lb['Type'],
+                    'region': region,
+                    'age_days': age_days
+                })
+                
+                if not DRY_RUN:
+                    try:
+                        delete_start = time.time()
+                        elbv2_client.delete_load_balancer(LoadBalancerArn=lb_arn)
+                        
+                        delete_duration = time.time() - delete_start
+                        log_performance('elbv2_delete_load_balancer', delete_duration,
+                                      lb_name=lb_name, region=region)
+                        
+                        lb_deleted += 1
+                        
+                        structured_log('INFO', "Load balancer deleted successfully",
+                                     resource_type='alb',
+                                     resource_id=lb_name,
+                                     region=region,
+                                     age_days=age_days,
+                                     action='deleted',
+                                     duration_ms=round(delete_duration * 1000, 2))
+                        
+                        # Publish success metric
+                        publish_cloudwatch_metric('LoadBalancersDeleted', 1,
+                                                 dimensions=[
+                                                     {'Name': 'Region', 'Value': region},
+                                                     {'Name': 'Type', 'Value': lb['Type']}
+                                                 ])
+                    except Exception as e:
+                        log_error(f"Failed to delete load balancer", e,
+                                resource_type='alb',
+                                resource_id=lb_name,
+                                region=region)
+                        summary.setdefault('errors', []).append(f"ALB {lb_name}: {str(e)}")
+                        
+                        # Publish failure metric
+                        publish_cloudwatch_metric('LoadBalancersFailedToDelete', 1,
+                                                 dimensions=[
+                                                     {'Name': 'Region', 'Value': region},
+                                                     {'Name': 'ErrorType', 'Value': type(e).__name__}
+                                                 ])
+                else:
+                    lb_deleted += 1  # Count for dry-run
+        
+        # Log operation summary
+        operation_duration = time.time() - operation_start
+        structured_log('INFO', "Load balancer scan completed",
+                      region=region,
+                      lb_processed=lb_processed,
+                      lb_deleted=lb_deleted,
+                      duration_ms=round(operation_duration * 1000, 2))
+        
+        # Update performance metrics
+        PERFORMANCE_METRICS['resource_counts']['elb'] = lb_deleted
+        
+    except Exception as e:
+        log_error(f"Failed to scan load balancers in {region}", e, region=region)
+        summary.setdefault('errors', []).append(f"ELB scan {region}: {str(e)}")
+    
+    # Handle Classic ELB
+    try:
+        elb_client = boto3.client('elb', region_name=region)
+        api_start = time.time()
+        response = elb_client.describe_load_balancers()
+        log_performance('elb_describe_load_balancers', time.time() - api_start, region=region)
+        
+        for lb in response['LoadBalancerDescriptions']:
+            lb_processed += 1
+            lb_name = lb['LoadBalancerName']
+            created_time = lb['CreatedTime']
+            age_days = get_age_days(created_time)
+            
+            # Check exclusions
+            if is_resource_excluded(lb_name, ELB_NAME_EXCLUSIONS):
+                continue
+            
+            if age_days >= MAX_AGE_DAYS:
+                summary.setdefault('load_balancers', []).append({
+                    'name': lb_name,
+                    'type': 'classic',
+                    'region': region,
+                    'age_days': age_days
+                })
+                
+                if not DRY_RUN:
+                    try:
+                        elb_client.delete_load_balancer(LoadBalancerName=lb_name)
+                        lb_deleted += 1
+                        structured_log('INFO', "Classic ELB deleted",
+                                     resource_type='elb_classic',
+                                     resource_id=lb_name,
+                                     region=region,
+                                     age_days=age_days)
+                    except Exception as e:
+                        log_error(f"Failed to delete classic ELB", e,
+                                resource_type='elb_classic',
+                                resource_id=lb_name,
+                                region=region)
+                else:
+                    lb_deleted += 1
+                    
+    except Exception as e:
+        log_error(f"Failed to scan classic ELBs in {region}", e, region=region)
+
+def cleanup_old_s3_buckets(summary):
+    """Delete S3 buckets older than MAX_AGE_DAYS (S3 is global but accessed via regions)"""
+    operation_start = time.time()
+    
+    structured_log('INFO', "Scanning S3 buckets",
+                  operation='s3_scan',
+                  max_age_days=MAX_AGE_DAYS)
+    
+    try:
+        s3_client = boto3.client('s3')
+        api_start = time.time()
+        response = s3_client.list_buckets()
+        log_performance('s3_list_buckets', time.time() - api_start)
+        
+        buckets_processed = 0
+        buckets_deleted = 0
+        
+        for bucket in response['Buckets']:
+            buckets_processed += 1
+            bucket_name = bucket['Name']
+            created_time = bucket['CreationDate']
+            age_days = get_age_days(created_time)
+            
+            # Check exclusions
+            if is_resource_excluded(bucket_name, S3_BUCKET_EXCLUSIONS):
+                structured_log('DEBUG', f"S3 bucket excluded from cleanup",
+                             resource_type='s3',
+                             resource_id=bucket_name,
+                             reason='exclusion_pattern_match')
+                continue
+            
+            # Log resource state
+            structured_log('DEBUG' if LOG_LEVEL == 'verbose' else 'INFO',
+                         "S3 bucket found",
+                         resource_type='s3',
+                         resource_id=bucket_name,
+                         age_days=age_days,
+                         action_required=age_days >= MAX_AGE_DAYS)
+            
+            if age_days >= MAX_AGE_DAYS:
+                # Get bucket region
+                try:
+                    bucket_location = s3_client.get_bucket_location(Bucket=bucket_name)
+                    bucket_region = bucket_location['LocationConstraint'] or 'us-east-1'
+                except:
+                    bucket_region = 'unknown'
+                
+                summary.setdefault('s3_buckets', []).append({
+                    'name': bucket_name,
+                    'region': bucket_region,
+                    'age_days': age_days
+                })
+                
+                if not DRY_RUN:
+                    try:
+                        # First, try to empty the bucket (only if it's small)
+                        delete_start = time.time()
+                        try:
+                            # List objects (limit to check if empty or small)
+                            objects = s3_client.list_objects_v2(Bucket=bucket_name, MaxKeys=100)
+                            
+                            if 'Contents' in objects and len(objects['Contents']) > 0:
+                                if len(objects['Contents']) < 100:  # Only auto-delete if small bucket
+                                    # Delete objects
+                                    delete_objects = {'Objects': [{'Key': obj['Key']} for obj in objects['Contents']]}
+                                    s3_client.delete_objects(Bucket=bucket_name, Delete=delete_objects)
+                                    structured_log('INFO', f"Emptied small S3 bucket",
+                                                 resource_id=bucket_name,
+                                                 object_count=len(objects['Contents']))
+                                else:
+                                    # Skip large buckets
+                                    structured_log('WARNING', f"S3 bucket not empty, skipping",
+                                                 resource_id=bucket_name,
+                                                 reason='bucket_not_empty')
+                                    summary.setdefault('errors', []).append(f"S3 {bucket_name}: Bucket not empty (>100 objects)")
+                                    continue
+                        except:
+                            pass  # Bucket might be empty
+                        
+                        # Delete the bucket
+                        s3_client.delete_bucket(Bucket=bucket_name)
+                        
+                        delete_duration = time.time() - delete_start
+                        log_performance('s3_delete_bucket', delete_duration, bucket_name=bucket_name)
+                        
+                        buckets_deleted += 1
+                        
+                        structured_log('INFO', "S3 bucket deleted successfully",
+                                     resource_type='s3',
+                                     resource_id=bucket_name,
+                                     region=bucket_region,
+                                     age_days=age_days,
+                                     action='deleted',
+                                     duration_ms=round(delete_duration * 1000, 2))
+                        
+                        # Publish success metric
+                        publish_cloudwatch_metric('S3BucketsDeleted', 1)
+                        
+                    except Exception as e:
+                        log_error(f"Failed to delete S3 bucket", e,
+                                resource_type='s3',
+                                resource_id=bucket_name)
+                        summary.setdefault('errors', []).append(f"S3 {bucket_name}: {str(e)}")
+                        
+                        # Publish failure metric
+                        publish_cloudwatch_metric('S3BucketsFailedToDelete', 1,
+                                                 dimensions=[
+                                                     {'Name': 'ErrorType', 'Value': type(e).__name__}
+                                                 ])
+                else:
+                    buckets_deleted += 1  # Count for dry-run
+        
+        # Log operation summary
+        operation_duration = time.time() - operation_start
+        structured_log('INFO', "S3 scan completed",
+                      buckets_processed=buckets_processed,
+                      buckets_deleted=buckets_deleted,
+                      duration_ms=round(operation_duration * 1000, 2))
+        
+        # Update performance metrics
+        PERFORMANCE_METRICS['resource_counts']['s3'] = buckets_deleted
+        
+    except Exception as e:
+        log_error(f"Failed to scan S3 buckets", e)
+        summary.setdefault('errors', []).append(f"S3 scan: {str(e)}")
+
+def cleanup_old_elasticsearch_domains(region, summary):
+    """Delete Elasticsearch/OpenSearch domains older than MAX_AGE_DAYS"""
+    operation_start = time.time()
+    
+    structured_log('INFO', "Scanning Elasticsearch/OpenSearch domains",
+                  region=region,
+                  operation='es_scan',
+                  max_age_days=MAX_AGE_DAYS)
+    
+    try:
+        # Try OpenSearch first (newer service)
+        try:
+            es_client = boto3.client('opensearch', region_name=region)
+            service_type = 'opensearch'
+        except:
+            # Fall back to Elasticsearch
+            es_client = boto3.client('es', region_name=region)
+            service_type = 'elasticsearch'
+        
+        api_start = time.time()
+        response = es_client.list_domain_names() if service_type == 'opensearch' else es_client.list_domain_names()
+        log_performance(f'{service_type}_list_domains', time.time() - api_start, region=region)
+        
+        domains_processed = 0
+        domains_deleted = 0
+        
+        for domain_info in response.get('DomainNames', []):
+            domains_processed += 1
+            domain_name = domain_info['DomainName']
+            
+            # Check exclusions
+            if is_resource_excluded(domain_name, ES_DOMAIN_EXCLUSIONS):
+                structured_log('DEBUG', f"ES domain excluded from cleanup",
+                             resource_type=service_type,
+                             resource_id=domain_name,
+                             region=region,
+                             reason='exclusion_pattern_match')
+                continue
+            
+            # Get domain details
+            try:
+                if service_type == 'opensearch':
+                    domain_config = es_client.describe_domain(DomainName=domain_name)
+                    domain = domain_config['DomainStatus']
+                else:
+                    domain_config = es_client.describe_elasticsearch_domain(DomainName=domain_name)
+                    domain = domain_config['DomainStatus']
+                
+                # Get creation time (if available)
+                created_time = domain.get('Created')
+                if not created_time:
+                    # Use current time minus 30 days as fallback (conservative)
+                    created_time = datetime.now(timezone.utc) - timedelta(days=30)
+                
+                age_days = get_age_days(created_time)
+                
+                # Log resource state
+                structured_log('DEBUG' if LOG_LEVEL == 'verbose' else 'INFO',
+                             f"{service_type.title()} domain found",
+                             resource_type=service_type,
+                             resource_id=domain_name,
+                             region=region,
+                             age_days=age_days,
+                             endpoint=domain.get('Endpoint', 'N/A'),
+                             processing=domain.get('Processing', False),
+                             action_required=age_days >= MAX_AGE_DAYS)
+                
+                if age_days >= MAX_AGE_DAYS and not domain.get('Processing', False):
+                    summary.setdefault('elasticsearch_domains', []).append({
+                        'name': domain_name,
+                        'type': service_type,
+                        'region': region,
+                        'age_days': age_days
+                    })
+                    
+                    if not DRY_RUN:
+                        try:
+                            delete_start = time.time()
+                            if service_type == 'opensearch':
+                                es_client.delete_domain(DomainName=domain_name)
+                            else:
+                                es_client.delete_elasticsearch_domain(DomainName=domain_name)
+                            
+                            delete_duration = time.time() - delete_start
+                            log_performance(f'{service_type}_delete_domain', delete_duration,
+                                          domain_name=domain_name, region=region)
+                            
+                            domains_deleted += 1
+                            
+                            structured_log('INFO', f"{service_type.title()} domain deleted successfully",
+                                         resource_type=service_type,
+                                         resource_id=domain_name,
+                                         region=region,
+                                         age_days=age_days,
+                                         action='deleted',
+                                         duration_ms=round(delete_duration * 1000, 2))
+                            
+                            # Publish success metric
+                            publish_cloudwatch_metric('ElasticsearchDomainsDeleted', 1,
+                                                     dimensions=[
+                                                         {'Name': 'Region', 'Value': region},
+                                                         {'Name': 'ServiceType', 'Value': service_type}
+                                                     ])
+                        except Exception as e:
+                            log_error(f"Failed to delete {service_type} domain", e,
+                                    resource_type=service_type,
+                                    resource_id=domain_name,
+                                    region=region)
+                            summary.setdefault('errors', []).append(f"ES {domain_name}: {str(e)}")
+                            
+                            # Publish failure metric
+                            publish_cloudwatch_metric('ElasticsearchDomainsFailedToDelete', 1,
+                                                     dimensions=[
+                                                         {'Name': 'Region', 'Value': region},
+                                                         {'Name': 'ErrorType', 'Value': type(e).__name__}
+                                                     ])
+                    else:
+                        domains_deleted += 1  # Count for dry-run
+                        
+            except Exception as e:
+                log_error(f"Failed to describe {service_type} domain {domain_name}", e,
+                        domain_name=domain_name, region=region)
+        
+        # Log operation summary
+        operation_duration = time.time() - operation_start
+        structured_log('INFO', f"{service_type.title()} scan completed",
+                      region=region,
+                      domains_processed=domains_processed,
+                      domains_deleted=domains_deleted,
+                      duration_ms=round(operation_duration * 1000, 2))
+        
+        # Update performance metrics
+        PERFORMANCE_METRICS['resource_counts']['elasticsearch'] = domains_deleted
+        
+    except Exception as e:
+        log_error(f"Failed to scan Elasticsearch domains in {region}", e, region=region)
+        summary.setdefault('errors', []).append(f"ES scan {region}: {str(e)}")
+
 def lambda_handler(event, context):
     """Main Lambda handler"""
     # Initialize performance tracking
@@ -607,6 +1044,9 @@ def lambda_handler(event, context):
         'rds_instances': [],
         'ecs_services': [],
         'nat_gateways': [],
+        'load_balancers': [],  # New resource type
+        's3_buckets': [],      # New resource type
+        'elasticsearch_domains': [],  # New resource type
         'errors': [],
         'performance_metrics': {}
     }
@@ -636,6 +1076,12 @@ def lambda_handler(event, context):
             # NAT Gateways
             cleanup_nat_gateways(ec2_client, region, summary)
             
+            # Load Balancers (ELB/ALB/NLB)
+            cleanup_old_load_balancers(region, summary)
+            
+            # Elasticsearch/OpenSearch Domains
+            cleanup_old_elasticsearch_domains(region, summary)
+            
             # Record region processing time
             region_duration = time.time() - region_start
             PERFORMANCE_METRICS['region_times'][region] = region_duration
@@ -652,12 +1098,22 @@ def lambda_handler(event, context):
             publish_cloudwatch_metric('RegionProcessingFailed', 1,
                                      dimensions=[{'Name': 'Region', 'Value': region}])
     
+    # S3 buckets are global, process them once after all regions
+    try:
+        cleanup_old_s3_buckets(summary)
+    except Exception as e:
+        log_error("Failed to process S3 buckets", e)
+        summary['errors'].append(f"S3 buckets: {str(e)}")
+    
     # Calculate totals
     total_resources = (
         len(summary['ec2_instances']) +
         len(summary['rds_instances']) +
         len(summary['ecs_services']) +
-        len(summary['nat_gateways'])
+        len(summary['nat_gateways']) +
+        len(summary.get('load_balancers', [])) +
+        len(summary.get('s3_buckets', [])) +
+        len(summary.get('elasticsearch_domains', []))
     )
     
     # Calculate execution metrics
@@ -735,6 +1191,9 @@ Resources Summary:
 - RDS Instances: {len(summary['rds_instances'])}
 - ECS Services: {len(summary['ecs_services'])}
 - NAT Gateways: {len(summary['nat_gateways'])}
+- Load Balancers: {len(summary.get('load_balancers', []))}
+- S3 Buckets: {len(summary.get('s3_buckets', []))}
+- Elasticsearch Domains: {len(summary.get('elasticsearch_domains', []))}
 
 Performance Metrics:
 - Execution Duration: {summary.get('performance_metrics', {}).get('execution_duration_ms', 'N/A')} ms

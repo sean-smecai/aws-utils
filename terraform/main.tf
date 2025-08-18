@@ -97,6 +97,24 @@ resource "aws_iam_role_policy" "lambda_policy" {
           "ecs:ListServices",
           "ecs:DescribeServices",
           "ecs:UpdateService",
+          "elasticloadbalancing:DescribeLoadBalancers",
+          "elasticloadbalancing:DeleteLoadBalancer",
+          "elasticloadbalancing:DescribeTags",
+          "s3:ListAllMyBuckets",
+          "s3:GetBucketLocation",
+          "s3:GetBucketCreationDate",
+          "s3:GetBucketTagging",
+          "s3:ListBucket",
+          "s3:DeleteBucket",
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion",
+          "s3:ListBucketVersions",
+          "es:ListDomainNames",
+          "es:DescribeElasticsearchDomain",
+          "es:DescribeElasticsearchDomains",
+          "es:DeleteElasticsearchDomain",
+          "es:AddTags",
+          "es:ListTags",
           "sts:GetCallerIdentity"
         ]
         Resource = "*"
@@ -154,6 +172,9 @@ resource "aws_lambda_function" "auto_shutdown" {
       SNS_TOPIC_ARN     = aws_sns_topic.notifications.arn
       REGIONS           = join(",", var.target_regions)
       LOG_LEVEL         = var.log_level
+      S3_BUCKET_EXCLUSIONS = var.s3_bucket_exclusions
+      ELB_NAME_EXCLUSIONS  = var.elb_name_exclusions
+      ES_DOMAIN_EXCLUSIONS = var.es_domain_exclusions
     }
   }
 

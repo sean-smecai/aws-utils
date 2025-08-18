@@ -60,3 +60,21 @@ variable "log_level" {
     error_message = "Log level must be either 'minimal' or 'verbose'."
   }
 }
+
+variable "s3_bucket_exclusions" {
+  description = "Comma-separated list of S3 bucket name patterns to exclude from cleanup"
+  type        = string
+  default     = "terraform-state,cloudtrail,logs,backup"
+}
+
+variable "elb_name_exclusions" {
+  description = "Comma-separated list of load balancer name patterns to exclude from cleanup"
+  type        = string
+  default     = "production,critical"
+}
+
+variable "es_domain_exclusions" {
+  description = "Comma-separated list of Elasticsearch domain name patterns to exclude from cleanup"
+  type        = string
+  default     = "production,logs"
+}
