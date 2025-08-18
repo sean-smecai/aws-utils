@@ -140,3 +140,32 @@ package-lock.json
 # ==========================================
 # tasks.json
 # tasks/ 
+
+# ==========================================
+# AI Assistant Configurations
+# ==========================================
+.windsurf/
+.trae/
+.taskmaster/
+.roo/
+.cursor/
+.kiro/
+.github/instructions/
+.claude/
+.clinerules/
+.gemini/
+.zed/
+.serena/
+.roomodes
+.rules
+.mcp.json
+
+# ==========================================
+# Project-specific Files
+# ==========================================
+aws-resources-report.json
+memories.json
+opencode.json
+AGENT.md
+AGENTS.md
+GEMINI.md
