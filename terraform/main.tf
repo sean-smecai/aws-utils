@@ -107,6 +107,13 @@ resource "aws_iam_role_policy" "lambda_policy" {
           "sns:Publish"
         ]
         Resource = aws_sns_topic.notifications.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:PutMetricData"
+        ]
+        Resource = "*"
       }
     ]
   })
@@ -188,4 +195,67 @@ data "archive_file" "lambda_zip" {
   type        = "zip"
   source_file = "${path.module}/lambda_function.py"
   output_path = "${path.module}/lambda_deployment.zip"
+}
+
+# CloudWatch Alarms for monitoring
+resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
+  alarm_name          = "aws-auto-shutdown-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period              = "300"
+  statistic           = "Sum"
+  threshold           = "0"
+  alarm_description   = "This metric monitors Lambda function errors"
+  alarm_actions       = [aws_sns_topic.notifications.arn]
+
+  dimensions = {
+    FunctionName = aws_lambda_function.auto_shutdown.function_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "lambda_duration" {
+  alarm_name          = "aws-auto-shutdown-duration"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "Duration"
+  namespace           = "AWS/Lambda"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "240000"  # 4 minutes in milliseconds
+  alarm_description   = "Alert when Lambda execution time exceeds 4 minutes"
+  alarm_actions       = [aws_sns_topic.notifications.arn]
+
+  dimensions = {
+    FunctionName = aws_lambda_function.auto_shutdown.function_name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "execution_failures" {
+  alarm_name          = "aws-auto-shutdown-execution-failures"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "ExecutionErrors"
+  namespace           = "AWS/AutoShutdown"
+  period              = "300"
+  statistic           = "Sum"
+  threshold           = "5"
+  alarm_description   = "Alert when more than 5 resources fail to shutdown"
+  alarm_actions       = [aws_sns_topic.notifications.arn]
+  treat_missing_data  = "notBreaching"
+}
+
+resource "aws_cloudwatch_metric_alarm" "high_resource_count" {
+  alarm_name          = "aws-auto-shutdown-high-resource-count"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "1"
+  metric_name         = "TotalResourcesProcessed"
+  namespace           = "AWS/AutoShutdown"
+  period              = "300"
+  statistic           = "Maximum"
+  threshold           = "50"
+  alarm_description   = "Alert when more than 50 resources are processed (potential cost impact)"
+  alarm_actions       = [aws_sns_topic.notifications.arn]
+  treat_missing_data  = "notBreaching"
 }
