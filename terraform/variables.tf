@@ -30,7 +30,7 @@ variable "scan_all_regions" {
 variable "target_regions" {
   description = "List of AWS regions to scan for old resources (used if scan_all_regions is false)"
   type        = list(string)
-  default     = [
+  default = [
     "us-east-1",
     "us-west-2",
     "ap-southeast-2",
@@ -42,7 +42,7 @@ variable "target_regions" {
 variable "schedule_expression" {
   description = "CloudWatch Events schedule expression"
   type        = string
-  default     = "cron(0 22 * * ? *)"  # 10 PM UTC daily
+  default     = "cron(0 22 * * ? *)" # 10 PM UTC daily
 }
 
 variable "enable_slack_notifications" {
@@ -89,6 +89,12 @@ variable "enable_workspaces_monitoring" {
   description = "Enable monitoring and shutdown of Amazon WorkSpaces"
   type        = bool
   default     = false
+}
+
+variable "enable_amplify_monitoring" {
+  description = "Enable Amplify app usage tracking (read-only, ~$0.60/mo)"
+  type        = bool
+  default     = true
 }
 
 variable "always_send_notification" {
@@ -152,7 +158,7 @@ variable "cost_threshold_require_approval" {
 variable "business_hours_start" {
   description = "Start of business hours (24-hour format) in UTC"
   type        = number
-  default     = 14  # 9 AM EST
+  default     = 14 # 9 AM EST
   validation {
     condition     = var.business_hours_start >= 0 && var.business_hours_start <= 23
     error_message = "Business hours start must be between 0 and 23."
@@ -162,7 +168,7 @@ variable "business_hours_start" {
 variable "business_hours_end" {
   description = "End of business hours (24-hour format) in UTC"
   type        = number
-  default     = 22  # 5 PM EST
+  default     = 22 # 5 PM EST
   validation {
     condition     = var.business_hours_end >= 0 && var.business_hours_end <= 23
     error_message = "Business hours end must be between 0 and 23."
@@ -172,7 +178,7 @@ variable "business_hours_end" {
 variable "cost_optimized_cleanup_windows" {
   description = "Comma-separated list of hour ranges for cost-optimized cleanup (e.g., '2-6,22-23')"
   type        = string
-  default     = "2-6,22-23"  # 2-6 AM and 10-11 PM UTC
+  default     = "2-6,22-23" # 2-6 AM and 10-11 PM UTC
 }
 
 variable "enable_cost_analysis" {
