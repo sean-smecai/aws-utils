@@ -51,7 +51,13 @@ variable "bedrock_token_alarm_threshold" {
 }
 
 variable "bedrock_alarm_period_seconds" {
-  description = "CloudWatch evaluation period (seconds) for the Bedrock token-spike alarm."
+  description = "Metric window (seconds) the kill-switch sums Bedrock tokens over each poll."
   type        = number
   default     = 300
+}
+
+variable "bedrock_killswitch_poll_rate" {
+  description = "EventBridge schedule for how often the kill-switch polls Bedrock token volume."
+  type        = string
+  default     = "rate(5 minutes)"
 }

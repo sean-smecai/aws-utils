@@ -3,13 +3,15 @@
 #
 #   1. Model allow-list : IAM Deny of InvokeModel on any non-approved model
 #                         (blocks Opus etc.). REAL-TIME, per request, no lag.
-#   2. Kill-switch       : CloudWatch alarm on Bedrock token volume -> SNS ->
-#                         Lambda that denies InvokeModel on every principal.
-#                         NEAR-REAL-TIME volume brake (~minutes).
+#   2. Kill-switch       : scheduled Lambda polls Bedrock token volume via
+#                         CloudWatch GetMetricData (SEARCH across all models --
+#                         metric ALARMS can't do SEARCH, GetMetricData can) and
+#                         denies InvokeModel on every principal on a spike.
+#                         NEAR-REAL-TIME volume brake (~one poll interval).
 #
 # Covers both AU Bedrock regions: ap-southeast-2 (Sydney) and ap-southeast-4
 # (Melbourne -- AU inference profiles route to Melbourne). IAM is global, so the
-# allow-list applies everywhere; only the alarm/Lambda are per-region.
+# allow-list applies everywhere; only the poller Lambda is per-region.
 #
 # All resources are gated by enable_* flags (default false) -- inert until armed.
 # =============================================================================
@@ -45,10 +47,9 @@ locals {
     TARGET_USERS    = join(",", var.bedrock_principal_users)
     SNS_TOPIC_ARN   = aws_sns_topic.notifications.arn
     DRY_RUN         = var.bedrock_killswitch_dry_run ? "true" : "false"
+    TOKEN_THRESHOLD = tostring(var.bedrock_token_alarm_threshold)
+    PERIOD_SECONDS  = tostring(var.bedrock_alarm_period_seconds)
   }
-
-  # Alarm on total Bedrock tokens (input + output) summed across all models.
-  bedrock_token_expression = "SUM(SEARCH('{AWS/Bedrock,ModelId} MetricName=\"InputTokenCount\"', 'Sum', ${var.bedrock_alarm_period_seconds})) + SUM(SEARCH('{AWS/Bedrock,ModelId} MetricName=\"OutputTokenCount\"', 'Sum', ${var.bedrock_alarm_period_seconds}))"
 }
 
 # ---- 1. Model allow-list ----------------------------------------------------
@@ -136,6 +137,12 @@ data "aws_iam_policy_document" "killswitch_perms" {
     }
   }
   statement {
+    sid       = "ReadBedrockMetrics"
+    effect    = "Allow"
+    actions   = ["cloudwatch:GetMetricData"]
+    resources = ["*"]
+  }
+  statement {
     sid       = "Notify"
     effect    = "Allow"
     actions   = ["sns:Publish"]
@@ -161,13 +168,7 @@ data "archive_file" "bedrock_killswitch_zip" {
   output_path = "${path.module}/bedrock_killswitch.zip"
 }
 
-# ---- 2b. Kill-switch wiring: Sydney (ap-southeast-2) -------------------------
-
-resource "aws_sns_topic" "bedrock_killswitch_syd" {
-  count    = local.killswitch_count
-  provider = aws.syd
-  name     = "bedrock-killswitch-trigger"
-}
+# ---- 2b. Kill-switch poller: Sydney (ap-southeast-2) ------------------------
 
 resource "aws_lambda_function" "bedrock_killswitch_syd" {
   count            = local.killswitch_count
@@ -179,53 +180,38 @@ resource "aws_lambda_function" "bedrock_killswitch_syd" {
   handler          = "bedrock_killswitch.lambda_handler"
   runtime          = "python3.11"
   timeout          = 60
-  environment { variables = local.killswitch_env }
+  environment {
+    variables = local.killswitch_env
+  }
 }
 
-resource "aws_sns_topic_subscription" "bedrock_killswitch_syd" {
+resource "aws_cloudwatch_event_rule" "bedrock_killswitch_syd" {
+  count               = local.killswitch_count
+  provider            = aws.syd
+  name                = "bedrock-killswitch-poll"
+  description         = "Poll Bedrock token volume and trip the kill-switch on a spike (ap-southeast-2)"
+  schedule_expression = var.bedrock_killswitch_poll_rate
+}
+
+resource "aws_cloudwatch_event_target" "bedrock_killswitch_syd" {
   count     = local.killswitch_count
   provider  = aws.syd
-  topic_arn = aws_sns_topic.bedrock_killswitch_syd[0].arn
-  protocol  = "lambda"
-  endpoint  = aws_lambda_function.bedrock_killswitch_syd[0].arn
+  rule      = aws_cloudwatch_event_rule.bedrock_killswitch_syd[0].name
+  target_id = "BedrockKillSwitch"
+  arn       = aws_lambda_function.bedrock_killswitch_syd[0].arn
 }
 
 resource "aws_lambda_permission" "bedrock_killswitch_syd" {
   count         = local.killswitch_count
   provider      = aws.syd
-  statement_id  = "AllowSNSInvoke"
+  statement_id  = "AllowEventBridgeInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.bedrock_killswitch_syd[0].function_name
-  principal     = "sns.amazonaws.com"
-  source_arn    = aws_sns_topic.bedrock_killswitch_syd[0].arn
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.bedrock_killswitch_syd[0].arn
 }
 
-resource "aws_cloudwatch_metric_alarm" "bedrock_tokens_syd" {
-  count               = local.killswitch_count
-  provider            = aws.syd
-  alarm_name          = "bedrock-token-spike-apse2"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  threshold           = var.bedrock_token_alarm_threshold
-  alarm_description   = "Bedrock input+output tokens spiked in ap-southeast-2 - kill-switch"
-  alarm_actions       = [aws_sns_topic.bedrock_killswitch_syd[0].arn]
-  treat_missing_data  = "notBreaching"
-
-  metric_query {
-    id          = "totaltokens"
-    expression  = local.bedrock_token_expression
-    label       = "TotalBedrockTokens"
-    return_data = true
-  }
-}
-
-# ---- 2c. Kill-switch wiring: Melbourne (ap-southeast-4) ----------------------
-
-resource "aws_sns_topic" "bedrock_killswitch_mel" {
-  count    = local.killswitch_count
-  provider = aws.mel
-  name     = "bedrock-killswitch-trigger"
-}
+# ---- 2c. Kill-switch poller: Melbourne (ap-southeast-4) ---------------------
 
 resource "aws_lambda_function" "bedrock_killswitch_mel" {
   count            = local.killswitch_count
@@ -237,42 +223,33 @@ resource "aws_lambda_function" "bedrock_killswitch_mel" {
   handler          = "bedrock_killswitch.lambda_handler"
   runtime          = "python3.11"
   timeout          = 60
-  environment { variables = local.killswitch_env }
+  environment {
+    variables = local.killswitch_env
+  }
 }
 
-resource "aws_sns_topic_subscription" "bedrock_killswitch_mel" {
+resource "aws_cloudwatch_event_rule" "bedrock_killswitch_mel" {
+  count               = local.killswitch_count
+  provider            = aws.mel
+  name                = "bedrock-killswitch-poll"
+  description         = "Poll Bedrock token volume and trip the kill-switch on a spike (ap-southeast-4)"
+  schedule_expression = var.bedrock_killswitch_poll_rate
+}
+
+resource "aws_cloudwatch_event_target" "bedrock_killswitch_mel" {
   count     = local.killswitch_count
   provider  = aws.mel
-  topic_arn = aws_sns_topic.bedrock_killswitch_mel[0].arn
-  protocol  = "lambda"
-  endpoint  = aws_lambda_function.bedrock_killswitch_mel[0].arn
+  rule      = aws_cloudwatch_event_rule.bedrock_killswitch_mel[0].name
+  target_id = "BedrockKillSwitch"
+  arn       = aws_lambda_function.bedrock_killswitch_mel[0].arn
 }
 
 resource "aws_lambda_permission" "bedrock_killswitch_mel" {
   count         = local.killswitch_count
   provider      = aws.mel
-  statement_id  = "AllowSNSInvoke"
+  statement_id  = "AllowEventBridgeInvoke"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.bedrock_killswitch_mel[0].function_name
-  principal     = "sns.amazonaws.com"
-  source_arn    = aws_sns_topic.bedrock_killswitch_mel[0].arn
-}
-
-resource "aws_cloudwatch_metric_alarm" "bedrock_tokens_mel" {
-  count               = local.killswitch_count
-  provider            = aws.mel
-  alarm_name          = "bedrock-token-spike-apse4"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  threshold           = var.bedrock_token_alarm_threshold
-  alarm_description   = "Bedrock input+output tokens spiked in ap-southeast-4 - kill-switch"
-  alarm_actions       = [aws_sns_topic.bedrock_killswitch_mel[0].arn]
-  treat_missing_data  = "notBreaching"
-
-  metric_query {
-    id          = "totaltokens"
-    expression  = local.bedrock_token_expression
-    label       = "TotalBedrockTokens"
-    return_data = true
-  }
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.bedrock_killswitch_mel[0].arn
 }
