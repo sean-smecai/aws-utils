@@ -140,6 +140,14 @@ resource "aws_iam_role_policy" "lambda_policy" {
           "cloudwatch:PutDashboard"
         ]
         Resource = "*"
+      },
+      {
+        # Read month-to-date spend for the global cost cap (Cost Explorer has no resource-level scoping)
+        Effect = "Allow"
+        Action = [
+          "ce:GetCostAndUsage"
+        ]
+        Resource = "*"
       }
     ]
   })
@@ -199,6 +207,8 @@ resource "aws_lambda_function" "auto_shutdown" {
       BUSINESS_HOURS_END              = var.business_hours_end
       COST_OPTIMIZED_CLEANUP_WINDOWS  = var.cost_optimized_cleanup_windows
       ENABLE_COST_ANALYSIS            = var.enable_cost_analysis
+      COST_CAP_ENABLED                = var.cost_cap_enabled ? "true" : "false"
+      MONTHLY_COST_CAP                = var.monthly_cost_cap
     }
   }
 
@@ -233,6 +243,30 @@ resource "aws_lambda_permission" "allow_eventbridge" {
   function_name = aws_lambda_function.auto_shutdown.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.daily_trigger.arn
+}
+
+# EventBridge rule for the frequent global spend-cap check.
+# Invokes the same Lambda with {"mode":"cost_cap_check"}: it reads month-to-date
+# spend and only runs a full shutdown when spend has reached MONTHLY_COST_CAP.
+resource "aws_cloudwatch_event_rule" "cost_cap_check" {
+  name                = "aws-auto-shutdown-cost-cap-check"
+  description         = "Check month-to-date spend against the global cap and shut down on breach"
+  schedule_expression = var.cost_cap_check_rate
+}
+
+resource "aws_cloudwatch_event_target" "cost_cap_check" {
+  rule      = aws_cloudwatch_event_rule.cost_cap_check.name
+  target_id = "CostCapCheckLambda"
+  arn       = aws_lambda_function.auto_shutdown.arn
+  input     = jsonencode({ mode = "cost_cap_check" })
+}
+
+resource "aws_lambda_permission" "allow_cost_cap_check" {
+  statement_id  = "AllowExecutionFromEventBridgeCostCap"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.auto_shutdown.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.cost_cap_check.arn
 }
 
 # Package Lambda function

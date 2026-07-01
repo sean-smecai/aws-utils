@@ -186,3 +186,27 @@ variable "enable_cost_analysis" {
   type        = bool
   default     = true
 }
+
+# --- Global monthly spend cap -> auto-shutdown ---
+
+variable "cost_cap_enabled" {
+  description = "Enable the global monthly spend cap. When on and monthly_cost_cap > 0, the Lambda shuts down all non-protected resources once month-to-date spend reaches the cap."
+  type        = bool
+  default     = true
+}
+
+variable "monthly_cost_cap" {
+  description = "Global month-to-date spend cap in USD. When reached, all non-protected resources are stopped. Set to 0 to disable enforcement."
+  type        = number
+  default     = 500
+  validation {
+    condition     = var.monthly_cost_cap >= 0
+    error_message = "monthly_cost_cap must be zero or positive."
+  }
+}
+
+variable "cost_cap_check_rate" {
+  description = "EventBridge schedule expression for how often to check month-to-date spend against the cap."
+  type        = string
+  default     = "rate(6 hours)"
+}

@@ -34,6 +34,12 @@ COST_PRIORITY_THRESHOLD = float(os.environ.get('COST_PRIORITY_THRESHOLD', '50'))
 SCHEDULING_MODE = os.environ.get('SCHEDULING_MODE', 'cost_optimized')  # cost_optimized|aggressive|conservative
 BUSINESS_HOURS_ONLY = os.environ.get('BUSINESS_HOURS_ONLY', 'false').lower() == 'true'
 
+# Global monthly spend cap -> auto-shutdown.
+# When month-to-date spend (Cost Explorer) reaches MONTHLY_COST_CAP, the handler
+# forces a full shutdown (MAX_AGE_DAYS=0) of all non-protected resources.
+COST_CAP_ENABLED = os.environ.get('COST_CAP_ENABLED', 'true').lower() == 'true'
+MONTHLY_COST_CAP = float(os.environ.get('MONTHLY_COST_CAP', '0'))  # USD; 0 disables the cap
+
 # Exclusion patterns for resource protection (for tagging)
 S3_BUCKET_EXCLUSIONS = os.environ.get('S3_BUCKET_EXCLUSIONS', 'terraform-state,cloudtrail,logs,backup').split(',')
 ELB_NAME_EXCLUSIONS = os.environ.get('ELB_NAME_EXCLUSIONS', 'production,critical').split(',')
@@ -1844,6 +1850,63 @@ def put_amplify_usage_dashboard(amplify_apps, dashboard_name='Amplify-App-Usage'
                  apps=len(amplify_apps))
 
 
+def get_month_to_date_spend():
+    """Return month-to-date unblended spend (USD) via Cost Explorer.
+
+    Returns None on any failure. This is deliberately fail-safe: if the spend
+    figure cannot be read, the caller must NOT trigger a shutdown.
+    Cost Explorer is only available through the us-east-1 endpoint.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        start = now.replace(day=1).strftime('%Y-%m-%d')
+        # Cost Explorer's End date is exclusive; use tomorrow so today's partial spend is included.
+        end = (now + timedelta(days=1)).strftime('%Y-%m-%d')
+        ce = boto3.client('ce', region_name='us-east-1')
+        resp = ce.get_cost_and_usage(
+            TimePeriod={'Start': start, 'End': end},
+            Granularity='MONTHLY',
+            Metrics=['UnblendedCost']
+        )
+        total = 0.0
+        for period in resp.get('ResultsByTime', []):
+            total += float(period['Total']['UnblendedCost']['Amount'])
+        return total
+    except Exception as e:
+        log_error("Failed to read month-to-date spend from Cost Explorer", e)
+        return None
+
+
+def get_spend_by_service(top_n=5):
+    """Return the top month-to-date spenders as a list of [service, amount], or [] on failure.
+
+    Called only when the cap is breached, so it adds no cost to the routine checks.
+    Shows WHICH services drove the breach (attribution is service-level, not per-resource).
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        start = now.replace(day=1).strftime('%Y-%m-%d')
+        end = (now + timedelta(days=1)).strftime('%Y-%m-%d')
+        ce = boto3.client('ce', region_name='us-east-1')
+        resp = ce.get_cost_and_usage(
+            TimePeriod={'Start': start, 'End': end},
+            Granularity='MONTHLY',
+            Metrics=['UnblendedCost'],
+            GroupBy=[{'Type': 'DIMENSION', 'Key': 'SERVICE'}]
+        )
+        totals = {}
+        for period in resp.get('ResultsByTime', []):
+            for group in period.get('Groups', []):
+                svc = group['Keys'][0]
+                amt = float(group['Metrics']['UnblendedCost']['Amount'])
+                totals[svc] = totals.get(svc, 0.0) + amt
+        ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
+        return [[svc, round(amt, 2)] for svc, amt in ranked[:top_n] if amt > 0]
+    except Exception as e:
+        log_error("Failed to read spend-by-service from Cost Explorer", e)
+        return []
+
+
 def lambda_handler(event, context):
     """Main Lambda handler"""
     # Initialize performance tracking
@@ -1863,8 +1926,53 @@ def lambda_handler(event, context):
     # Load protection configuration
     load_protection_config()
 
-    # Check scheduling constraints
-    if not should_cleanup_based_on_schedule():
+    # Allow overriding config via event payload (applied before cap/schedule logic)
+    if 'max_age_days' in event:
+        MAX_AGE_DAYS = int(event['max_age_days'])
+
+    if 'dry_run' in event:
+        DRY_RUN = bool(event['dry_run'])
+
+    # --- Global monthly spend cap enforcement ---
+    # Runs on every invocation (including the every-6h 'cost_cap_check' schedule) and
+    # bypasses business-hours scheduling: a breach must be able to stop spend 24/7.
+    # 'monthly_cost_cap' can be overridden per-invocation to run a safe dry-run breach test.
+    mode = event.get('mode')
+    cost_cap_breached = False
+    cost_cap_breakdown = []
+    mtd_spend = None
+    effective_cap = float(event['monthly_cost_cap']) if 'monthly_cost_cap' in event else MONTHLY_COST_CAP
+    if COST_CAP_ENABLED and effective_cap > 0:
+        # 'test_mtd_spend' injects a spend value for safe breach testing (bypasses Cost Explorer).
+        mtd_spend = float(event['test_mtd_spend']) if 'test_mtd_spend' in event else get_month_to_date_spend()
+        if mtd_spend is not None and mtd_spend >= effective_cap:
+            cost_cap_breached = True
+            MAX_AGE_DAYS = 0  # force shutdown of everything non-protected
+            cost_cap_breakdown = get_spend_by_service()  # which services drove the breach
+            structured_log('WARNING', "MONTHLY COST CAP BREACHED - forcing full shutdown",
+                          mtd_spend=round(mtd_spend, 2),
+                          monthly_cost_cap=effective_cap,
+                          top_spenders=[f"{svc}=${amt:.2f}" for svc, amt in cost_cap_breakdown],
+                          dry_run=DRY_RUN)
+        else:
+            structured_log('INFO', "Monthly spend checked - under cap",
+                          mtd_spend=(round(mtd_spend, 2) if mtd_spend is not None else 'unavailable'),
+                          monthly_cost_cap=effective_cap)
+
+    # Lightweight 'cost_cap_check' invocations exit early when under the cap (no full scan).
+    if mode == 'cost_cap_check' and not cost_cap_breached:
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': "Cost cap check completed - under cap, no action taken",
+                'correlation_id': CORRELATION_ID,
+                'mtd_spend': mtd_spend,
+                'monthly_cost_cap': effective_cap
+            })
+        }
+
+    # Check scheduling constraints (a cap breach bypasses the scheduled window)
+    if not cost_cap_breached and not should_cleanup_based_on_schedule():
         structured_log('INFO', "Cleanup skipped due to scheduling constraints",
                       scheduling_mode=SCHEDULING_MODE,
                       business_hours_only=BUSINESS_HOURS_ONLY)
@@ -1876,12 +1984,6 @@ def lambda_handler(event, context):
                 'scheduling_mode': SCHEDULING_MODE
             })
         }
-
-    if 'max_age_days' in event:
-        MAX_AGE_DAYS = int(event['max_age_days'])
-
-    if 'dry_run' in event:
-        DRY_RUN = bool(event['dry_run'])
 
     # Log execution start with context info
     structured_log('INFO', "AWS Auto-Shutdown execution started",
@@ -1900,6 +2002,10 @@ def lambda_handler(event, context):
         'correlation_id': CORRELATION_ID,
         'max_age_days': MAX_AGE_DAYS,
         'dry_run': DRY_RUN,
+        'cost_cap_breached': cost_cap_breached,
+        'mtd_spend': mtd_spend,
+        'monthly_cost_cap': effective_cap,
+        'cost_cap_breakdown': cost_cap_breakdown,
         'ec2_instances': [],
         'rds_instances': [],
         'ecs_services': [],
@@ -2048,9 +2154,14 @@ def lambda_handler(event, context):
         if count > 0:
             publish_cloudwatch_metric(f'{resource_type}ResourcesProcessed', count)
 
-    # Send SNS notification based on configuration
-    if SNS_TOPIC_ARN and (ALWAYS_SEND_NOTIFICATION or total_resources > 0):
-        send_notification(summary, total_resources)
+    # Send SNS notification based on configuration.
+    # On a cost-cap-triggered run, only notify when something was actually stopped, so the
+    # every-6h checks don't spam once the cap stays breached for the rest of the month.
+    should_notify = (not event.get('skip_notification')) and SNS_TOPIC_ARN and (
+        total_resources > 0 or (ALWAYS_SEND_NOTIFICATION and not cost_cap_breached)
+    )
+    if should_notify:
+        send_notification(summary, total_resources, cost_cap_breached, mtd_spend, effective_cap)
 
     return {
         'statusCode': 200,
@@ -2062,12 +2173,16 @@ def lambda_handler(event, context):
         })
     }
 
-def send_notification(summary, total_resources):
+def send_notification(summary, total_resources, cost_cap_breached=False, mtd_spend=None, cost_cap=None):
     """Send SNS notification with enhanced shutdown summary"""
     sns_client = boto3.client('sns')
+    cap = cost_cap if cost_cap is not None else MONTHLY_COST_CAP
 
-    # Adjust subject based on whether resources were found
-    if total_resources == 0:
+    # Adjust subject based on cap breach / whether resources were found
+    if cost_cap_breached:
+        spend_str = f"${mtd_spend:.2f}" if mtd_spend is not None else "unknown"
+        subject = f"AWS COST CAP BREACHED ({spend_str} >= ${cap:.0f}) - {total_resources} resources {'identified' if DRY_RUN else 'stopped'}"
+    elif total_resources == 0:
         subject = f"AWS Auto-Shutdown: Scan Complete - No Old Resources Found"
     else:
         subject = f"AWS Auto-Shutdown: {total_resources} resources {'identified' if DRY_RUN else 'stopped/tagged'}"
@@ -2077,8 +2192,25 @@ def send_notification(summary, total_resources):
     monthly_savings = cost_analysis.get('total_monthly_savings', 0)
     high_value_resources = cost_analysis.get('high_value_resources', [])
 
+    cap_banner = ""
+    if cost_cap_breached:
+        spend_str = f"${mtd_spend:.2f}" if mtd_spend is not None else "unknown"
+        breakdown = summary.get('cost_cap_breakdown', [])
+        drivers = ""
+        if breakdown:
+            drivers = "Top spend drivers this month:\n" + "".join(
+                f"  - {svc}: ${amt:.2f}\n" for svc, amt in breakdown)
+        cap_banner = (
+            f"\n*** MONTHLY COST CAP BREACHED ***\n"
+            f"Month-to-date spend {spend_str} has reached the ${cap:.0f} cap.\n"
+            f"{drivers}"
+            f"NOTE: shutdown stops ALL non-protected resources, not only these drivers.\n"
+            f"All non-protected resources were {'identified (dry run)' if DRY_RUN else 'STOPPED'}. "
+            f"Restart is manual.\n"
+        )
+
     message = f"""AWS Auto-Shutdown Report
-{'=' * 50}
+{'=' * 50}{cap_banner}
 Mode: {'DRY RUN' if DRY_RUN else 'EXECUTED'}
 Time: {summary['timestamp']}
 Correlation ID: {summary.get('correlation_id', 'N/A')}
