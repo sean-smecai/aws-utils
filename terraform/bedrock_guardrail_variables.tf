@@ -45,9 +45,9 @@ variable "bedrock_allowed_model_keywords" {
 }
 
 variable "bedrock_token_alarm_threshold" {
-  description = "Kill-switch trips if (input+output) Bedrock tokens in one period exceed this. TUNE to normal volume."
+  description = "Kill-switch trips if (input+output) Bedrock tokens in one period exceed this. Tuned 2026-07-02: 28-day peak 5-min bucket was 62,346 tokens (Sydney); 500k = ~8x headroom, ~$500+/day if sustained."
   type        = number
-  default     = 2000000
+  default     = 500000
 }
 
 variable "bedrock_alarm_period_seconds" {

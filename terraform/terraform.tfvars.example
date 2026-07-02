@@ -62,3 +62,18 @@ monthly_cost_cap = 500 # USD; set to 0 to disable
 
 # How often to check spend against the cap (EventBridge schedule expression).
 cost_cap_check_rate = "rate(6 hours)"
+
+# --- Bedrock guardrails ---
+# IMPORTANT: these enable flags default to false. If the kill-switch is deployed
+# and you apply without them, Terraform DESTROYS it. Keep them in terraform.tfvars.
+
+# Model allow-list (deny non-haiku/sonnet). Leave false: attaching it would break
+# pdf-to-hl7 (Opus) and medaudit (Nova/DeepSeek).
+enable_bedrock_guardrail = false
+
+# Runaway kill-switch: per-region poller denies Bedrock InvokeModel on all
+# configured principals when 5-min token volume exceeds the threshold.
+# Recovery after a trip is manual (see ROLLBACK.md).
+enable_bedrock_killswitch     = true
+bedrock_killswitch_dry_run    = false  # true = log-only
+bedrock_token_alarm_threshold = 500000 # tokens per 5-min bucket (tuned 2026-07-02)

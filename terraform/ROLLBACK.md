@@ -48,10 +48,28 @@ terraform apply -var-file=terraform.tfvars
 This destroys: the cost-cap event rule, the Bedrock allow-list/deny policies,
 the kill-switch Lambdas/alarms/SNS, and reverts the Lambda code + IAM.
 
+## Recovering from a kill-switch trip
+Armed since 2026-07-02 (threshold 500k tokens/5min, ~8x normal peak). A trip
+attaches the `bedrock-killswitch-deny` policy to every configured principal and
+emails the SNS topic. Once the runaway is resolved, detach it manually:
+
+```bash
+for role in medaudit-amplify-compute pdf-to-coreplus-amplify-compute \
+    AmplifyComputeRole-ddv0o3k8wcjhr medical-llm-amplify-compute \
+    docmediflow-amplify-compute; do
+  aws iam detach-role-policy --role-name "$role" \
+    --policy-arn arn:aws:iam::843448676102:policy/bedrock-killswitch-deny
+done
+aws iam detach-user-policy --user-name remede-wellness-bedrock-service \
+  --policy-arn arn:aws:iam::843448676102:policy/bedrock-killswitch-deny
+```
+
 ## Notes
 - Level 1 is the emergency brake — instant, safe, no data loss.
-- The Bedrock kill-switch ships in **dry-run** (logs only) until the token
-  threshold is tuned, so it cannot deny anyone until deliberately armed.
+- **terraform.tfvars must keep `enable_bedrock_killswitch = true`** — the
+  variable defaults to false, so an apply without it silently destroys the
+  kill-switch. The live tfvars in this directory is the source of truth.
 - The model allow-list is **not attached** to apps that use Opus / Nova /
   DeepSeek (pdf-to-hl7, medaudit, pdf-to-coreplus) — attaching it there would
-  break them. See the guardrail plan for the per-app decision.
+  break them. Decision 2026-07-02: keep it disabled; the kill-switch covers
+  runaway spend and the broad apps turned out to have auth.
