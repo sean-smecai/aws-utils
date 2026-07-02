@@ -56,7 +56,7 @@ emails the SNS topic. Once the runaway is resolved, detach it manually:
 ```bash
 for role in medaudit-amplify-compute pdf-to-coreplus-amplify-compute \
     AmplifyComputeRole-ddv0o3k8wcjhr medical-llm-amplify-compute \
-    docmediflow-amplify-compute; do
+    docmediflow-amplify-compute genotype-health-amplify-compute; do
   aws iam detach-role-policy --role-name "$role" \
     --policy-arn arn:aws:iam::843448676102:policy/bedrock-killswitch-deny
 done

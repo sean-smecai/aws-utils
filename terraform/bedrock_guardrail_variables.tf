@@ -27,11 +27,12 @@ variable "bedrock_principal_roles" {
     "AmplifyComputeRole-ddv0o3k8wcjhr", # pdf-to-hl7
     "medical-llm-amplify-compute",
     "docmediflow-amplify-compute",
+    "genotype-health-amplify-compute", # created 2026-07-02, replaced sean's static admin key
   ]
 }
 
 variable "bedrock_principal_users" {
-  description = "IAM user names holding static Bedrock keys. TODO: confirm + add genotype-health's key user."
+  description = "IAM user names holding static Bedrock keys. genotype-health resolved 2026-07-02: its key was sean's ADMIN key, replaced by a compute role (see bedrock_principal_roles)."
   type        = list(string)
   default = [
     "remede-wellness-bedrock-service",
