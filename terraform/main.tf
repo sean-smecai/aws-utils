@@ -1,13 +1,13 @@
 terraform {
   required_version = ">= 1.0"
-  
+
   required_providers {
     aws = {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
   }
-  
+
   backend "s3" {
     bucket = "aws-utils-terraform-state-bucket"
     key    = "aws-utils/auto-shutdown/terraform.tfstate"
@@ -26,7 +26,7 @@ data "aws_region" "current" {}
 # Create S3 bucket for Lambda deployment packages
 resource "aws_s3_bucket" "lambda_bucket" {
   bucket = "${data.aws_caller_identity.current.account_id}-aws-auto-shutdown-lambda"
-  
+
   tags = {
     Name        = "AWS Auto Shutdown Lambda"
     Environment = "production"
@@ -119,6 +119,8 @@ resource "aws_iam_role_policy" "lambda_policy" {
           "workspaces:StopWorkspaces",
           "workspaces:TerminateWorkspaces",
           "workspaces:ModifyWorkspaceProperties",
+          "amplify:ListApps",
+          "amplify:ListBranches",
           "sts:GetCallerIdentity"
         ]
         Resource = "*"
@@ -133,7 +135,17 @@ resource "aws_iam_role_policy" "lambda_policy" {
       {
         Effect = "Allow"
         Action = [
-          "cloudwatch:PutMetricData"
+          "cloudwatch:GetMetricStatistics",
+          "cloudwatch:PutMetricData",
+          "cloudwatch:PutDashboard"
+        ]
+        Resource = "*"
+      },
+      {
+        # Read month-to-date spend for the global cost cap (Cost Explorer has no resource-level scoping)
+        Effect = "Allow"
+        Action = [
+          "ce:GetCostAndUsage"
         ]
         Resource = "*"
       }
@@ -162,38 +174,41 @@ resource "aws_sns_topic_subscription" "email" {
 resource "aws_lambda_function" "auto_shutdown" {
   filename         = "${path.module}/lambda_deployment.zip"
   function_name    = "aws-auto-shutdown"
-  role            = aws_iam_role.lambda_role.arn
-  handler         = "lambda_function.lambda_handler"
+  role             = aws_iam_role.lambda_role.arn
+  handler          = "lambda_function.lambda_handler"
   source_code_hash = data.archive_file.lambda_zip.output_base64sha256
-  runtime         = "python3.11"
-  timeout         = 300  # 5 minutes
-  memory_size     = 256
+  runtime          = "python3.11"
+  timeout          = 300 # 5 minutes
+  memory_size      = 256
 
   environment {
     variables = {
-      MAX_AGE_DAYS       = var.max_age_days
-      DRY_RUN           = var.dry_run
-      SNS_TOPIC_ARN     = aws_sns_topic.notifications.arn
-      SCAN_ALL_REGIONS  = var.scan_all_regions ? "true" : "false"
-      REGIONS           = join(",", var.target_regions)
-      ENABLE_WORKSPACES_MONITORING = var.enable_workspaces_monitoring ? "true" : "false"
-      ALWAYS_SEND_NOTIFICATION = var.always_send_notification ? "true" : "false"
-      LOG_LEVEL         = var.log_level
-      S3_BUCKET_EXCLUSIONS = var.s3_bucket_exclusions
-      ELB_NAME_EXCLUSIONS  = var.elb_name_exclusions
-      ES_DOMAIN_EXCLUSIONS = var.es_domain_exclusions
-      PROTECTION_ENABLED = var.protection_enabled
-      CONFIG_SOURCE      = var.config_source
-      CONFIG_S3_BUCKET   = var.config_s3_bucket
-      CONFIG_S3_KEY      = var.config_s3_key
-      OVERRIDE_ENABLED   = var.override_enabled
-      COST_OPTIMIZATION_ENABLED = var.cost_optimization_enabled
-      COST_THRESHOLD_HIGH = var.cost_threshold_high
+      MAX_AGE_DAYS                    = var.max_age_days
+      DRY_RUN                         = var.dry_run
+      SNS_TOPIC_ARN                   = aws_sns_topic.notifications.arn
+      SCAN_ALL_REGIONS                = var.scan_all_regions ? "true" : "false"
+      REGIONS                         = join(",", var.target_regions)
+      ENABLE_WORKSPACES_MONITORING    = var.enable_workspaces_monitoring ? "true" : "false"
+      ENABLE_AMPLIFY_MONITORING       = var.enable_amplify_monitoring ? "true" : "false"
+      ALWAYS_SEND_NOTIFICATION        = var.always_send_notification ? "true" : "false"
+      LOG_LEVEL                       = var.log_level
+      S3_BUCKET_EXCLUSIONS            = var.s3_bucket_exclusions
+      ELB_NAME_EXCLUSIONS             = var.elb_name_exclusions
+      ES_DOMAIN_EXCLUSIONS            = var.es_domain_exclusions
+      PROTECTION_ENABLED              = var.protection_enabled
+      CONFIG_SOURCE                   = var.config_source
+      CONFIG_S3_BUCKET                = var.config_s3_bucket
+      CONFIG_S3_KEY                   = var.config_s3_key
+      OVERRIDE_ENABLED                = var.override_enabled
+      COST_OPTIMIZATION_ENABLED       = var.cost_optimization_enabled
+      COST_THRESHOLD_HIGH             = var.cost_threshold_high
       COST_THRESHOLD_REQUIRE_APPROVAL = var.cost_threshold_require_approval
-      BUSINESS_HOURS_START = var.business_hours_start
-      BUSINESS_HOURS_END = var.business_hours_end
-      COST_OPTIMIZED_CLEANUP_WINDOWS = var.cost_optimized_cleanup_windows
-      ENABLE_COST_ANALYSIS = var.enable_cost_analysis
+      BUSINESS_HOURS_START            = var.business_hours_start
+      BUSINESS_HOURS_END              = var.business_hours_end
+      COST_OPTIMIZED_CLEANUP_WINDOWS  = var.cost_optimized_cleanup_windows
+      ENABLE_COST_ANALYSIS            = var.enable_cost_analysis
+      COST_CAP_ENABLED                = var.cost_cap_enabled ? "true" : "false"
+      MONTHLY_COST_CAP                = var.monthly_cost_cap
     }
   }
 
@@ -206,7 +221,7 @@ resource "aws_lambda_function" "auto_shutdown" {
 # CloudWatch Logs
 resource "aws_cloudwatch_log_group" "lambda_logs" {
   name              = "/aws/lambda/aws-auto-shutdown"
-  retention_in_days = 1  # Minimal retention for free tier
+  retention_in_days = 1 # Minimal retention for free tier
 }
 
 # EventBridge rule for daily execution
@@ -228,6 +243,30 @@ resource "aws_lambda_permission" "allow_eventbridge" {
   function_name = aws_lambda_function.auto_shutdown.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.daily_trigger.arn
+}
+
+# EventBridge rule for the frequent global spend-cap check.
+# Invokes the same Lambda with {"mode":"cost_cap_check"}: it reads month-to-date
+# spend and only runs a full shutdown when spend has reached MONTHLY_COST_CAP.
+resource "aws_cloudwatch_event_rule" "cost_cap_check" {
+  name                = "aws-auto-shutdown-cost-cap-check"
+  description         = "Check month-to-date spend against the global cap and shut down on breach"
+  schedule_expression = var.cost_cap_check_rate
+}
+
+resource "aws_cloudwatch_event_target" "cost_cap_check" {
+  rule      = aws_cloudwatch_event_rule.cost_cap_check.name
+  target_id = "CostCapCheckLambda"
+  arn       = aws_lambda_function.auto_shutdown.arn
+  input     = jsonencode({ mode = "cost_cap_check" })
+}
+
+resource "aws_lambda_permission" "allow_cost_cap_check" {
+  statement_id  = "AllowExecutionFromEventBridgeCostCap"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.auto_shutdown.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.cost_cap_check.arn
 }
 
 # Package Lambda function
@@ -263,7 +302,7 @@ resource "aws_cloudwatch_metric_alarm" "lambda_duration" {
   namespace           = "AWS/Lambda"
   period              = "300"
   statistic           = "Average"
-  threshold           = "240000"  # 4 minutes in milliseconds
+  threshold           = "240000" # 4 minutes in milliseconds
   alarm_description   = "Alert when Lambda execution time exceeds 4 minutes"
   alarm_actions       = [aws_sns_topic.notifications.arn]
 

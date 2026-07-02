@@ -10,6 +10,7 @@ The AWS Auto-Shutdown service helps manage cloud costs by automatically cleaning
 
 - **Automated Resource Management**: Stops/deletes resources older than configured threshold
 - **Multi-Region Support**: Scans and manages resources across multiple AWS regions
+- **Amplify Usage Tracking**: Read-only nightly snapshot of request counts per Amplify app
 - **Cost Optimization**: Intelligent scheduling with cost impact analysis
 - **Protection System**: Whitelist/blacklist patterns to protect critical resources
 - **Comprehensive Logging**: Structured JSON logging with CloudWatch integration
@@ -19,13 +20,14 @@ The AWS Auto-Shutdown service helps manage cloud costs by automatically cleaning
 ### Supported Resource Types
 
 - **EC2 Instances**: Stops instances older than threshold
-- **RDS Databases**: Stops database instances  
+- **RDS Databases**: Stops database instances
 - **ECS Services**: Scales services to 0 tasks
 - **NAT Gateways**: Deletes gateways and releases Elastic IPs
 - **Load Balancers**: Removes ELB/ALB/NLB load balancers
 - **S3 Buckets**: Deletes buckets (with safety checks)
 - **Elasticsearch/OpenSearch**: Deletes domains
 - **Amazon WorkSpaces**: Stops running WorkSpaces (when enabled)
+- **Amplify Apps**: **Read-only** — reports CloudWatch request counts per app, never modifies them
 
 ## Quick Start
 
@@ -246,6 +248,7 @@ notification_email = "your-email@example.com"
 | `scan_all_regions` | Automatically scan ALL AWS regions | false |
 | `target_regions` | AWS regions to scan (if scan_all_regions is false) | ["us-east-1", "us-west-2", "ap-southeast-2", "ap-southeast-4", "eu-west-1"] |
 | `enable_workspaces_monitoring` | Monitor and stop Amazon WorkSpaces | false |
+| `enable_amplify_monitoring` | Read-only Amplify app usage tracking in the nightly email (~$0.60/mo) | true |
 | `always_send_notification` | Send email even when no resources found | true |
 | `schedule_expression` | CloudWatch Events schedule | "cron(0 22 * * ? *)" |
 | `log_level` | Logging verbosity (minimal/verbose) | "minimal" |
@@ -287,6 +290,135 @@ schedule_expression = "rate(12 hours)"
 # Weekdays only at 6 PM UTC
 schedule_expression = "cron(0 18 ? * MON-FRI *)"
 ```
+
+## Amplify App Usage Tracking
+
+The Lambda also reports request traffic for every AWS Amplify app it can see, so you can tell which apps are still being used and which are deployed-and-forgotten. **This feature is strictly read-only — it never tags, stops, or deletes Amplify apps.**
+
+### What it does
+
+On each nightly run, the Lambda iterates the regions in `target_regions` (or every region if `scan_all_regions = true`), lists all Amplify apps, and queries the CloudWatch `AWS/AmplifyHosting/Requests` metric per app for the trailing 90 days. It buckets the daily datapoints into three windows — **7 days / 30 days / 90 days** — and adds a section to the SNS email sorted by `requests_30d` descending. Zero-traffic apps cluster at the bottom of the list.
+
+New Amplify apps are picked up automatically on the next run; deleted apps drop out. No per-app configuration or per-repo instrumentation is required.
+
+### Sample email output
+
+```
+Amplify App Usage (Requests: 7d / 30d / 90d):
+  - pdf-to-coreplus (d3rgegijwscmel) in ap-southeast-2 Updated: 2026-05-04
+      1234 / 4567 / 12890
+      https://ap-southeast-2.console.aws.amazon.com/amplify/apps/d3rgegijwscmel/branches
+  - medical-llm (d7ev0xll7z5fm) in ap-southeast-2 Updated: 2026-05-12
+      0 / 0 / 0
+      https://ap-southeast-2.console.aws.amazon.com/amplify/apps/d7ev0xll7z5fm/branches
+  ...
+```
+
+The `Updated:` timestamp is the app's last configuration change (from `list-apps`), not the last successful deploy — useful for telling "genuinely idle" apart from "touched recently but no traffic."
+
+### How to see the usage
+
+There are six ways to view Amplify usage data, from easiest to most direct:
+
+**1. Open the auto-managed CloudWatch dashboard (best for browsing)**
+
+The Lambda calls `cloudwatch:PutDashboard` on every nightly run, rebuilding a dashboard called **`Amplify-App-Usage`** in the Lambda's running region. It always reflects the current set of Amplify apps — new apps appear automatically, deleted apps drop off. Three widgets: daily requests time series (30 days), 30-day total bar chart, 7-day total bar chart. Open it at:
+
+```
+https://ap-southeast-2.console.aws.amazon.com/cloudwatch/home?region=ap-southeast-2#dashboards:name=Amplify-App-Usage
+```
+
+The dashboard is recreated every run, so manual edits will be overwritten — change widget shape via `put_amplify_usage_dashboard()` in `lambda_function.py`. Cost: $0 for the first 3 dashboards in your account, $3/mo each after that.
+
+**2. Wait for the nightly email**
+
+The SNS email is sent once per day (10pm UTC by default). The Amplify section appears near the bottom of the body, sorted by 30-day request count descending.
+
+**3. Trigger a run on-demand**
+
+```bash
+aws lambda invoke \
+  --function-name aws-auto-shutdown \
+  --payload '{}' \
+  --region ap-southeast-2 \
+  response.json
+```
+
+The email arrives ~30–60 seconds later. The full per-app data is also in `response.json` under `summary.amplify_apps`. To extract it:
+
+```bash
+jq '.summary.amplify_apps | sort_by(-.requests_30d)' response.json
+```
+
+**4. Query CloudWatch directly for a specific app**
+
+To see request counts for one app without running the Lambda:
+
+```bash
+APP_ID="d3rgegijwscmel"   # replace with your appId from `aws amplify list-apps`
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/AmplifyHosting \
+  --metric-name Requests \
+  --dimensions Name=App,Value=$APP_ID \
+  --start-time "$(date -u -v-30d +%Y-%m-%dT%H:%M:%S)" \
+  --end-time "$(date -u +%Y-%m-%dT%H:%M:%S)" \
+  --period 86400 \
+  --statistics Sum \
+  --region ap-southeast-2 \
+  --query 'Datapoints | sort_by(@, &Timestamp)[].[Timestamp, Sum]' \
+  --output table
+```
+
+**5. Browse the custom CloudWatch metrics**
+
+The Lambda publishes `AmplifyAppsScanned` and `AmplifyAppsWithZeroTraffic30d` per region under the custom namespace. View trends over time at:
+
+```
+https://ap-southeast-2.console.aws.amazon.com/cloudwatch/home?region=ap-southeast-2#metricsV2:graph=~()
+```
+
+Then filter for namespace `AWS/AutoShutdown` and pick `AmplifyAppsScanned` or `AmplifyAppsWithZeroTraffic30d`.
+
+**6. Tail the Lambda logs**
+
+The structured JSON logs also contain the per-app data (useful when debugging):
+
+```bash
+aws logs tail /aws/lambda/aws-auto-shutdown --follow --region ap-southeast-2 \
+  | grep -i amplify
+```
+
+### Enabling and disabling
+
+Enabled by default. To turn off (e.g. if you don't want the extra section in your email):
+
+```hcl
+# In terraform.tfvars
+enable_amplify_monitoring = false
+```
+
+Apply with `terraform apply`. Affects only the email/metrics — no resources change.
+
+### Custom CloudWatch metrics
+
+Each run publishes two metrics under the existing custom namespace, per region:
+
+- `AmplifyAppsScanned` — number of apps successfully queried
+- `AmplifyAppsWithZeroTraffic30d` — apps with zero requests over the trailing 30 days
+
+You can graph either in CloudWatch or build an alarm (e.g. alert when `AmplifyAppsWithZeroTraffic30d` exceeds N).
+
+### IAM permissions used
+
+The Lambda's execution role is granted these **read-only** actions:
+
+- `amplify:ListApps`
+- `amplify:ListBranches`
+- `cloudwatch:GetMetricStatistics`
+
+### Cost
+
+Roughly **$0.60/month** in the default configuration — almost entirely custom-metric storage ($0.30/metric/month × 2 new metrics). API calls cost less than $0.01/month at any realistic app count. Disabling `enable_amplify_monitoring` drops this to $0.
 
 ## Deployment
 
@@ -411,7 +543,8 @@ Configuration optimized for free tier:
   - Minimal logging: ~$0-0.50/month (stays in free tier)
   - Verbose logging: ~$1-3/month (may exceed free tier)
 - **SNS**: Free tier covers 1,000 email notifications/month
-- **Total**: < $1/month with minimal logging
+- **Amplify monitoring** (if `enable_amplify_monitoring = true`): ~$0.60/month for two custom CloudWatch metrics
+- **Total**: < $2/month with minimal logging and Amplify monitoring enabled (< $1/month without)
 
 ### Cost Optimization Tips
 
